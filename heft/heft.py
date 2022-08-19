@@ -44,6 +44,7 @@ C0 = np.array([
     [0, 1, 1],
     [1, 0, 1],
     [1, 1, 0]
+    M
 ])
 
 """
@@ -63,7 +64,7 @@ class OpMode(Enum):
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, **kwargs):
+def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, **kwargs):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
     of that DAG onto that set of PEs 
@@ -75,6 +76,8 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         'computation_matrix': computation_matrix,
         'communication_matrix': communication_matrix,
         'communication_startup': communication_startup,
+        'mem_mem_matrix' : None,
+        'mem_pe_matrix' : None,
         'task_schedules': {},
         'proc_schedules': proc_schedules,
         'numExistingJobs': 0,
@@ -162,6 +165,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         
         else:
             for proc in range(len(communication_matrix)):
+                logger.debug(f" What is a node? {type(node)} {node}")
                 taskschedule = _compute_eft(_self, dag, node, proc)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
@@ -415,6 +419,72 @@ def readDagMatrix(dag_file, show_dag=False):
 
     return dag
 
+def readMultiCsvToNumpyMatrix(csv_file):
+    """
+    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
+    this function reads that data into a numpy matrix and strips the top row and leftmost column
+    """
+    with open(csv_file) as fd:
+        logger.debug(f"Reading the contents of {csv_file} into a matrix")
+        contents = fd.read()
+        contentsList = contents.split('\n')
+        contentsList = list(map(lambda line: line.split(','), contentsList))
+        contentsList = list(filter(lambda arr: arr != [''], contentsList))
+        
+        matrix = np.array(contentsList)
+        matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
+        matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
+        matrix = matrix.astype(float)
+        logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
+        return matrix
+
+def readMultiDagMatrix(dag_file, show_dag=False):
+    """
+    Given an input file consisting of a connectivity matrix, reads and parses it into a networkx Directional Graph (DiGraph)
+    """
+    #matrix = readCsvToNumpyMatrix(dag_file)
+    with open(dag_file) as fd:
+        logger.debug(f"Reading the contents of {dag_file} into a matrix")
+        contents = fd.read()
+        contentsList = contents.split('\n')
+        contentsList = list(map(lambda line: line.split(','), contentsList))
+        contentsList = list(filter(lambda arr: arr != [''], contentsList))
+        logger.debug(f"Content list:\n{contentsList}")
+
+        newDag = nx.MultiDiGraph()
+
+        #Ignore first line and first column
+        for line, lval in enumerate(contentsList[1:]):
+            for col, cval in enumerate(lval[1:]):
+                wvals = cval.split('-')
+                for widx, w in enumerate(wvals):
+                    wv = float(w)
+                    if wv != 0.0:
+                        NEwDag.add_edge(line, col, key=widx, rsize=wv)
+                ##
+            ##
+        ##
+        logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{newDag}")
+
+        
+        #matrix = np.array(contentsList)
+        #matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
+        #matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
+        #matrix = matrix.astype(float)
+        #logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
+
+        #dag = nx.MultiDiGraph(matrix)
+        #dag.remove_edges_from(
+            # Remove all edges with weight of 0 since we have no placeholder for "this edge doesn't exist" in the input file
+        #    [edge for edge in dag.edges() if dag.get_edge_data(*edge)['weight'] == '0.0']
+        #)
+
+        if show_dag:
+            nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
+            plt.show()
+
+    return newDag
+
 def generate_argparser():
     parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
     parser.add_argument("-d", "--dag_file", 
@@ -426,6 +496,10 @@ def generate_argparser():
     parser.add_argument("-t", "--task_execution_file", 
                         help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Topcuoglu 2002 if none given.", 
                         type=str, default="test/canonicalgraph_task_exe_time.csv")
+    parser.add_argument("--memconn", type=str, required=True,
+                        help="File containing connectivity/bandwidth information about Memory elements.")
+    parser.add_argument("--mempe", type=str, required=True,
+                        help="File containing connectivity between memory and processors.")
     parser.add_argument("-l", "--loglevel", 
                         help="The log level to be used in this module. Default: INFO", 
                         type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
@@ -452,7 +526,11 @@ if __name__ == "__main__":
 
     communication_matrix = readCsvToNumpyMatrix(args.pe_connectivity_file)
     computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
-    dag = readDagMatrix(args.dag_file, args.showDAG) 
+    mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
+    mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
+
+    #dag = readDagMatrix(args.dag_file, args.showDAG) 
+    dag = readMultiDagMatrix(args.dag_file, args.showDAG)
     
     if (communication_matrix.shape[0] != communication_matrix.shape[1]):
         assert communication_matrix.shape[0]-1 == communication_matrix.shape[1], "If the communication_matrix CSV is non-square, there must only be a single additional row specifying the communication startup costs of each PE"
@@ -462,7 +540,7 @@ if __name__ == "__main__":
     else:
         communication_startup = np.zeros(communication_matrix.shape[0])
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric)
+    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=mem_mem_matrix, mem_pe_matrix=mem_pe_matrix)
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
