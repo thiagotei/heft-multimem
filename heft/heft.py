@@ -8,6 +8,7 @@ from enum import Enum
 
 import argparse
 import logging
+import json
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -44,7 +45,6 @@ C0 = np.array([
     [0, 1, 1],
     [1, 0, 1],
     [1, 1, 0]
-    M
 ])
 
 """
@@ -64,7 +64,7 @@ class OpMode(Enum):
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, **kwargs):
+def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, mapping=None, taskdepweights=None, machinemodel=None, **kwargs):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
     of that DAG onto that set of PEs 
@@ -76,8 +76,10 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         'computation_matrix': computation_matrix,
         'communication_matrix': communication_matrix,
         'communication_startup': communication_startup,
-        'mem_mem_matrix' : None,
-        'mem_pe_matrix' : None,
+        'mem_mem_matrix' : mem_mem_matrix,
+        'mem_pe_matrix' : mem_pe_matrix,
+        'machinemodel' : machinemodel,
+        'taskdepweights' : taskdepweights,
         'task_schedules': {},
         'proc_schedules': proc_schedules,
         'numExistingJobs': 0,
@@ -166,7 +168,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         else:
             for proc in range(len(communication_matrix)):
                 logger.debug(f" What is a node? {type(node)} {node}")
-                taskschedule = _compute_eft(_self, dag, node, proc)
+                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, machinemodel)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
         
@@ -318,7 +320,37 @@ def _node_can_be_processed(_self, dag, node):
             return False
     return True
 
-def _compute_eft(_self, dag, node, proc):
+def _calc_comm_time(node, prednode, proc, taskdepweights, machinemodel):
+    """
+    Calculate communication cost based on the predecessor node and node according to mapping
+    of overlapping region arguments.
+    The mapping only defines the kind of memory, here needs to pick on physical memory of that selected kind accessible
+    by processor selected.
+    """
+    commcost = 0.0
+    commdecisions = {}
+#    if node in taskdepweights:
+#        for dep in taskdepweights[node]:
+#            ra_src = dep[2]
+#            ra_dst = dep[5]
+#            if dep[1] == prednode:
+#                mincostcommra = sys.maxsize
+#                bestmem = None
+#                for mem in machinemodel[proc].memories:
+#                    costcommra = _transfer_time(prednode, ra_src, scheduled[node][ra_src].mem, node, ra_dst, mem)
+#                    if mincostcommra > costcommra:
+#                        mincostcommra = costcommra
+#                        bestmem = mem
+#                    #
+#                ##
+#                commdecisions[ra_dst] = (mincostcommra, bestmem)
+#                commcost += mincostcommra
+#            ##
+#        ##
+#    ##
+    return commcost
+
+def _compute_eft(_self, dag, node, proc, taskdepweights, machinemodel):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -326,6 +358,10 @@ def _compute_eft(_self, dag, node, proc):
     """
     ready_time = _self.time_offset
     logger.debug(f"Computing EFT for node {node} on processor {proc}")
+    #for ra of node.ras:
+        # for mem of proc:
+            # if mem == mapping[node.name][ra]:
+
     for prednode in list(dag.predecessors(node)):
         predjob = _self.task_schedules[prednode]
         assert predjob != None, f"Predecessor nodes must be scheduled before their children, but node {node} has an unscheduled predecessor of {prednode}"
@@ -333,7 +369,9 @@ def _compute_eft(_self, dag, node, proc):
         if _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
-            ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
+            commtime = _calc_comm_time(node, prednode, proc, taskdepweights, machinemodel)
+            #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
+            ready_time_t = predjob.end + commtime
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
         if ready_time_t > ready_time:
             ready_time = ready_time_t
@@ -485,6 +523,41 @@ def readMultiDagMatrix(dag_file, show_dag=False):
 
     return newDag
 
+def readMapping(mapping_file):
+
+    with open(mapping_file, 'r') as m_open_file:
+        mapping = json.load(m_open_file)
+
+    return mapping
+
+def readMachineModel(mm_file):
+    with open(mm_file, 'r') as mm_fd:
+        machmodel = json.load(mm_fd)
+
+    return machmodel
+
+def readTaskDepWeigths(taskdep_file):
+    """
+    Read a file with a dependence between tasks per region argument in bytes.
+    """
+    with open(taskdep_file, 'r') as fd:
+        contents = fd.read()
+        contentsList = contents.split('\n')
+        contentsList = list(map(lambda line: line.split(','), contentsList))
+        contentsList = list(filter(lambda arr: arr != [''], contentsList))
+
+        # a dict per destination task instance
+        taskdepwgts = {}
+
+        for r in contentsList:
+            assert len(r) == 7,f"Expecting 7 fieds on taskdep file, but got {len(r)}"
+            taskdepwgts[r[4]] = r
+        #
+
+    return taskdepwgts
+
+
+
 def generate_argparser():
     parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
     parser.add_argument("-d", "--dag_file", 
@@ -496,10 +569,16 @@ def generate_argparser():
     parser.add_argument("-t", "--task_execution_file", 
                         help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Topcuoglu 2002 if none given.", 
                         type=str, default="test/canonicalgraph_task_exe_time.csv")
-    parser.add_argument("--memconn", type=str, required=True,
-                        help="File containing connectivity/bandwidth information about Memory elements.")
-    parser.add_argument("--mempe", type=str, required=True,
-                        help="File containing connectivity between memory and processors.")
+#    parser.add_argument("--memconn", type=str, required=True,
+#                        help="File containing connectivity/bandwidth information about Memory elements.")
+#    parser.add_argument("--mempe", type=str, required=True,
+#                        help="File containing connectivity between memory and processors.")
+    parser.add_argument("--mmodel", type=str, required=True, dest="machine_model_file",
+                        help="File containing the machine model.")
+    parser.add_argument("--mapping", type=str, required=True, dest="mapping_file", 
+                        help="File containing mapping decisions.")
+    parser.add_argument("--taskdepra", type=str, required=True, dest="task_dep_weights",
+                        help="File containing the machine model.")
     parser.add_argument("-l", "--loglevel", 
                         help="The log level to be used in this module. Default: INFO", 
                         type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
@@ -524,13 +603,20 @@ if __name__ == "__main__":
     consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
     logger.addHandler(consolehandler)
 
+    #receive mapping
+    mapping = readMapping(args.mapping_file)
+    # receive taskdepcomm
+    taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
+    # machine mode desc
+    machmodel = readMachineModel(args.machine_model_file)
     communication_matrix = readCsvToNumpyMatrix(args.pe_connectivity_file)
     computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
-    mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
-    mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
+    #mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
+    #mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
 
-    #dag = readDagMatrix(args.dag_file, args.showDAG) 
-    dag = readMultiDagMatrix(args.dag_file, args.showDAG)
+    dag = readDagMatrix(args.dag_file, args.showDAG) 
+    # For now, the dag do not weight per region argument between task instances.
+    #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
     
     if (communication_matrix.shape[0] != communication_matrix.shape[1]):
         assert communication_matrix.shape[0]-1 == communication_matrix.shape[1], "If the communication_matrix CSV is non-square, there must only be a single additional row specifying the communication startup costs of each PE"
@@ -540,7 +626,7 @@ if __name__ == "__main__":
     else:
         communication_startup = np.zeros(communication_matrix.shape[0])
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=mem_mem_matrix, mem_pe_matrix=mem_pe_matrix)
+    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel)
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
