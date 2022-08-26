@@ -64,7 +64,7 @@ class OpMode(Enum):
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, mapping=None, taskdepweights=None, machinemodel=None, **kwargs):
+def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, mapping=None, taskdepweights=None, machinemodel=None, task_inst_names=None, **kwargs):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
     of that DAG onto that set of PEs 
@@ -168,7 +168,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         else:
             for proc in range(len(communication_matrix)):
                 logger.debug(f" What is a node? {type(node)} {node}")
-                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, machinemodel)
+                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
         
@@ -320,20 +320,103 @@ def _node_can_be_processed(_self, dag, node):
             return False
     return True
 
-def _calc_comm_time(node, prednode, proc, taskdepweights, machinemodel):
+def _mem_name_fix(memname):
+    """ Mapping memory names from mapping to machine model.
+    """
+
+    #print(memname)
+    name = 'N/A'
+    if memname == 'Z_COPY_MEM':
+        name = 'sys_mem'
+    elif memname == 'GPU_FB_MEM':
+        name = 'gpu_fb_mem'
+    elif memname == 'SYSTEM_MEM':
+        name = 'sys_mem'
+    else:
+        raise RuntimeError("Memory kind not found.")
+    #
+    return name
+
+def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel):
+    """ Return transfer time in nanoseconds.
+        Linear model numbers per task are in nanoseconds.
+    """
+
+    src_mem = _mem_name_fix(ra_src_mem)
+    dst_mem = _mem_name_fix(ra_dst_mem)
+    transfer_time = 0.0
+
+    # If in the same node
+        # If in the same socket
+
+    pathname = src_mem+'_to_'+dst_mem
+
+    if pathname not in machinemodel['paths']:
+        raise RuntimeError(f"Unknown {pathname} in machine model paths!")
+    #
+
+    path = machinemodel['paths'][pathname]['intra_socket']
+        # not in the same socket
+        #else
+        #
+
+    # not in the same node
+    #else
+    #
+
+    for p in path:
+        # Dual channle pci_to_host and pci_to_dev not in use yet.
+        if p.startswith("pci"):
+            p = "pci"
+        #
+
+        if p not in machinemodel['interconnect']:
+            raise RuntimeError(f"Interconnect {p} not found in machine model!")
+        #
+
+        icon = machinemodel['interconnect'][p]
+
+        # latency in ms
+        lat_p = icon['latency']
+        # bw in GB/s
+        bw_p = icon['bandwidth']
+        # bw in bytes / ns
+        bw_p = bw_p
+        transfer_time +=  lat_p*1.0e6 + (datasize/bw_p)
+
+    logger.debug(transfer_time)
+    return transfer_time
+
+def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweights, mapping, machinemodel, task_inst_names):
     """
     Calculate communication cost based on the predecessor node and node according to mapping
     of overlapping region arguments.
     The mapping only defines the kind of memory, here needs to pick on physical memory of that selected kind accessible
     by processor selected.
     """
+    #print(mapping)
     commcost = 0.0
     commdecisions = {}
-#    if node in taskdepweights:
-#        for dep in taskdepweights[node]:
-#            ra_src = dep[2]
-#            ra_dst = dep[5]
-#            if dep[1] == prednode:
+
+    nodename = nodeattrs["taskinstname"]
+    prednodename = prednodeattrs["taskinstname"]
+
+    if nodename in taskdepweights:
+        #print("[calc_comm_time]",prednode, prednodename, node, nodename, nodename in taskdepweights)
+        for dep in taskdepweights[nodename]:
+            #print("       ",dep )
+            pdtaskname = dep[0]
+            nodetaskname   = dep[3]
+            ra_src = dep[2]
+            ra_dst = dep[5]
+            datasize = float(dep[6])
+            if dep[1] == prednodename:
+                ra_src_mem = mapping['mapping'][pdtaskname]['regions'][str(ra_src)]
+                ra_dst_mem = mapping['mapping'][nodetaskname]['regions'][str(ra_dst)]
+                #print(pdtaskname,ra_src,ra_src_mem, nodetaskname, ra_dst, ra_dst_mem, datasize, type(datasize))
+                #commcost += datasize*(1/10)
+                #commcost += _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel)
+                commcost += _transfer_time(None, ra_src_mem, None, ra_dst_mem, datasize, machinemodel)
 #                mincostcommra = sys.maxsize
 #                bestmem = None
 #                for mem in machinemodel[proc].memories:
@@ -347,15 +430,17 @@ def _calc_comm_time(node, prednode, proc, taskdepweights, machinemodel):
 #                commcost += mincostcommra
 #            ##
 #        ##
+        logger.info(f"Comm cost {commcost} ns")
 #    ##
     return commcost
 
-def _compute_eft(_self, dag, node, proc, taskdepweights, machinemodel):
+def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
     It then looks at the list of tasks scheduled on this particular processor and determines the earliest time (after ready_time) a given node can be inserted into this processor's queue
     """
+    #print(type(dag.nodes[node]), dag.nodes[node])
     ready_time = _self.time_offset
     logger.debug(f"Computing EFT for node {node} on processor {proc}")
     #for ra of node.ras:
@@ -369,7 +454,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, machinemodel):
         if _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
-            commtime = _calc_comm_time(node, prednode, proc, taskdepweights, machinemodel)
+            commtime = _calc_comm_time(node, dag.nodes[node], prednode, dag.nodes[prednode], proc, taskdepweights, mapping, machinemodel, task_inst_names)
             #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
             ready_time_t = predjob.end + commtime
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
@@ -420,11 +505,14 @@ def readCsvToNumpyMatrix(csv_file):
         contentsList = list(filter(lambda arr: arr != [''], contentsList))
         
         matrix = np.array(contentsList)
+        # Matrix has id for each node, but we need the actula node names.
+        nodenames = list(matrix[0, 1:])
         matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
         matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
         matrix = matrix.astype(float)
+        logger.debug(f"Nodenames:\n{nodenames}")
         logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
-        return matrix
+        return matrix, nodenames
 
 def readCsvToDict(csv_file):
     """
@@ -443,7 +531,7 @@ def readDagMatrix(dag_file, show_dag=False):
     """
     Given an input file consisting of a connectivity matrix, reads and parses it into a networkx Directional Graph (DiGraph)
     """
-    matrix = readCsvToNumpyMatrix(dag_file)
+    matrix, nodesnames = readCsvToNumpyMatrix(dag_file)
 
     dag = nx.DiGraph(matrix)
     dag.remove_edges_from(
@@ -451,6 +539,15 @@ def readDagMatrix(dag_file, show_dag=False):
         [edge for edge in dag.edges() if dag.get_edge_data(*edge)['weight'] == '0.0']
     )
 
+    attrs = {}
+    for n in dag.nodes:
+        attrs[n] = {"taskinstname" : nodesnames[n]}
+
+    nx.set_node_attributes(dag, attrs)
+    #print("Blah:\n",dag.nodes[0]["taskinstname"])
+    #print("Blah:\n", attrs)
+
+    #print(list(dag.nodes))
     if show_dag:
         nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
         plt.show()
@@ -548,15 +645,36 @@ def readTaskDepWeigths(taskdep_file):
 
         # a dict per destination task instance
         taskdepwgts = {}
+        #print(contentsList)
 
         for r in contentsList:
             assert len(r) == 7,f"Expecting 7 fieds on taskdep file, but got {len(r)}"
-            taskdepwgts[r[4]] = r
+            if r[4] not in taskdepwgts:
+                taskdepwgts[r[4]] = []
+            #
+
+            taskdepwgts[r[4]].append(r)
         #
 
     return taskdepwgts
 
 
+def readTaskNames(tasknames_file):
+    with open(tasknames_file, 'r') as fd:
+        contents = fd.read()
+        contentsList = contents.split('\n')
+        contentsList = list(map(lambda line: line.split(','), contentsList))
+        contentsList = list(filter(lambda arr: arr != [''], contentsList))
+
+        nodestasknames = {}
+
+        for line in contentsList:
+            for node in line[1:]:
+                nodestasknames[line[0]] = node
+            ##
+        ##
+
+    return nodestasknames
 
 def generate_argparser():
     parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
@@ -579,6 +697,8 @@ def generate_argparser():
                         help="File containing mapping decisions.")
     parser.add_argument("--taskdepra", type=str, required=True, dest="task_dep_weights",
                         help="File containing the machine model.")
+    parser.add_argument("--tasknames", type=str, required=True, dest="taskinstancesnames",
+                        help="File containing the task names each node represent." )
     parser.add_argument("-l", "--loglevel", 
                         help="The log level to be used in this module. Default: INFO", 
                         type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
@@ -609,8 +729,10 @@ if __name__ == "__main__":
     taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
     # machine mode desc
     machmodel = readMachineModel(args.machine_model_file)
-    communication_matrix = readCsvToNumpyMatrix(args.pe_connectivity_file)
-    computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
+    # nodes to task names
+    tasknames = readTaskNames(args.taskinstancesnames)
+    communication_matrix,_ = readCsvToNumpyMatrix(args.pe_connectivity_file)
+    computation_matrix,_ = readCsvToNumpyMatrix(args.task_execution_file)
     #mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
     #mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
 
@@ -626,7 +748,7 @@ if __name__ == "__main__":
     else:
         communication_startup = np.zeros(communication_matrix.shape[0])
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel)
+    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel, task_inst_names=tasknames)
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
