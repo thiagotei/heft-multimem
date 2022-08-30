@@ -13,9 +13,36 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
+import pandas as pd
 
 logger = logging.getLogger('heft')
 
+class MemKind(Enum):
+    FB = 'GPU_FB_MEM' 
+    ZC = 'Z_COPY_MEM'
+    SY = 'SYSTEM_MEM'
+#
+
+class ProcKind(Enum):
+    LOC = 'LOC_PROC'
+    TOC = 'TOC_PROC'
+    OMP = 'OMP_PROC'
+
+    @staticmethod
+    def key(val):
+        if val == 'LOC_PROC':
+            return ProcKind.LOC
+        elif val == 'TOC_PROC':
+            return ProcKind.TOC
+        elif val == 'OMP_PROC':
+            return ProcKind.OMP
+        else:
+            raise RuntimeError("[Processor] {} value not valid!".format(val))
+        #
+    #
+#
+
+Proc = namedtuple('Proc', 'id kind node socket')
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
 
 """
@@ -64,7 +91,7 @@ class OpMode(Enum):
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, mapping=None, taskdepweights=None, machinemodel=None, task_inst_names=None, **kwargs):
+def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, mapping=None, taskdepweights=None, machinemodel=None, task_inst_names=None, procs=None, pkindscol=None, **kwargs):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
     of that DAG onto that set of PEs 
@@ -89,22 +116,34 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
     _self = SimpleNamespace(**_self)
 
     for proc in proc_schedules:
+        logger.info(f"Update num existing jobs")
         _self.numExistingJobs = _self.numExistingJobs + len(proc_schedules[proc])
 
     if relabel_nodes:
+        logger.info(f"Relabel nodes {relabel_nodes} {_self.numExistingJobs}")
         dag = nx.relabel_nodes(dag, dict(map(lambda node: (node, node+_self.numExistingJobs), list(dag.nodes()))))
     else:
         #Negates any offsets that would have been needed had the jobs been relabeled
         _self.numExistingJobs = 0
 
+    logger.debug(f"task_schedules iniatilized here? {_self.task_schedules}\n numExistingJobs {_self.numExistingJobs} len comp mat : {len(_self.computation_matrix)}")
     for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
         _self.task_schedules[i] = None
+    
+
     for i in range(len(_self.communication_matrix)):
+    #for p in procs:
+        #logger.info(f"p: {p}")
+        #if p.id not in _self.proc_schedules:
         if i not in _self.proc_schedules:
+            #logger.info(f"Creating proc schedule {p.id}")
+            #_self.proc_schedules[p.id] = []
             _self.proc_schedules[i] = []
 
     for proc in proc_schedules:
+        logger.info(f"proc: {proc}")
         for schedule_event in proc_schedules[proc]:
+            logger.info(f"Schedule event in proc {proc}: {schedule_event}")
             _self.task_schedules[schedule_event.task] = schedule_event
 
     # Nodes with no successors cause the any expression to be empty    
@@ -122,10 +161,13 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         logger.debug("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
         idx = sorted_nodes.index(root_node)
         sorted_nodes[idx], sorted_nodes[0] = sorted_nodes[0], sorted_nodes[idx]
+
+    logger.debug(f"task_schedules: {_self.task_schedules}")
+    logger.debug(f"sorted_nodes: {sorted_nodes}")
     for node in sorted_nodes:
         if _self.task_schedules[node] is not None:
             continue
-        minTaskSchedule = ScheduleEvent(node, inf, inf, -1)
+        minTaskSchedule = ScheduleEvent(node, inf, inf, Proc(-1, None, None, None))
         minEDP = inf
         op_mode = kwargs.get("op_mode", OpMode.EFT)
         if op_mode == OpMode.EDP_ABS:
@@ -133,7 +175,8 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
             taskschedules = []
             minScheduleStart = inf
 
-            for proc in range(len(communication_matrix)):
+            #for proc in range(len(communication_matrix)):
+            for proc in procs:
                 taskschedule = _compute_eft(_self, dag, node, proc)
                 edp_t = ((taskschedule.end - taskschedule.start)**2) * kwargs["power_dict"][node][proc]
                 if (edp_t < minEDP):
@@ -147,7 +190,8 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
             taskschedules = []
             minScheduleStart = inf
 
-            for proc in range(len(communication_matrix)):
+            #for proc in range(len(communication_matrix)):
+            for proc in procs:
                 taskschedules.append(_compute_eft(_self, dag, node, proc))
                 if taskschedules[proc].start < minScheduleStart:
                     minScheduleStart = taskschedules[proc].start
@@ -167,14 +211,17 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         
         else:
             for proc in range(len(communication_matrix)):
+            #for proc in procs:
                 logger.debug(f" What is a node? {type(node)} {node}")
-                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names)
+                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names, pkindscol)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
         
         _self.task_schedules[node] = minTaskSchedule
         _self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
         _self.proc_schedules[minTaskSchedule.proc] = sorted(_self.proc_schedules[minTaskSchedule.proc], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
+        #_self.proc_schedules[minTaskSchedule.proc.id].append(minTaskSchedule)
+        #_self.proc_schedules[minTaskSchedule.proc.id] = sorted(_self.proc_schedules[minTaskSchedule.proc.id], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug('\n')
             for proc, jobs in _self.proc_schedules.items():
@@ -326,14 +373,14 @@ def _mem_name_fix(memname):
 
     #print(memname)
     name = 'N/A'
-    if memname == 'Z_COPY_MEM':
+    if memname == MemKind.ZC.value:
         name = 'sys_mem'
-    elif memname == 'GPU_FB_MEM':
+    elif memname == MemKind.FB.value:
         name = 'gpu_fb_mem'
-    elif memname == 'SYSTEM_MEM':
+    elif memname == MemKind.SY.value:
         name = 'sys_mem'
     else:
-        raise RuntimeError("Memory kind not found.")
+        raise RuntimeError(f"Memory kind {memname} not found.")
     #
     return name
 
@@ -434,7 +481,7 @@ def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweigh
 #    ##
     return commcost
 
-def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names):
+def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names, pkindscol):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -462,6 +509,13 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
             ready_time = ready_time_t
     logger.debug(f"\tReady time determined to be {ready_time}")
 
+    # improve this later by having the col with its name using pandas
+    #for i, c in enumerate(pkindscol):
+    #    if c == proc.kind.value:
+    #        colnum = i
+    #        break
+
+    #computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc.kind.value]
     computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc]
     job_list = _self.proc_schedules[proc]
     for idx in range(len(job_list)):
@@ -491,6 +545,16 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
         min_schedule = ScheduleEvent(node, ready_time, ready_time + computation_time, proc)
     logger.debug(f"\tFor node {node} on processor {proc}, the EFT is {min_schedule}")
     return min_schedule    
+
+def readCsvToPandas(csv_file):
+    """
+    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
+    this function reads that data into a numpy matrix and strips the top row and leftmost column
+    """
+    df = pd.read_csv(csv_file)
+    #print(df.dtypes)
+    logger.info(f"Reading the contents of {csv_file} into a dataframe:\n{df}")
+    return df
 
 def readCsvToNumpyMatrix(csv_file):
     """
@@ -676,6 +740,27 @@ def readTaskNames(tasknames_file):
 
     return nodestasknames
 
+def createProcs(machmodel):
+    numnodes   = machmodel['num_nodes']
+    numsocks   = machmodel['num_sockets_per_node']
+    numcpusock = machmodel['num_cpus_per_socket']
+    numgpusock = machmodel['num_gpus_per_socket']
+
+    procs = []
+    globalid = 0
+    for n in range(numnodes):
+        for s in range(numsocks):
+            for c in range(numcpusock):
+                procs.append(Proc(globalid, ProcKind.LOC, n, s))
+                globalid += 1
+
+            for g in range(numgpusock):
+                procs.append(Proc(globalid, ProcKind.TOC, n, s))
+                globalid += 1
+
+    return procs
+#
+
 def generate_argparser():
     parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
     parser.add_argument("-d", "--dag_file", 
@@ -729,10 +814,13 @@ if __name__ == "__main__":
     taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
     # machine mode desc
     machmodel = readMachineModel(args.machine_model_file)
+    # processors data structure based on mach model
+    procs = createProcs(machmodel)
     # nodes to task names
     tasknames = readTaskNames(args.taskinstancesnames)
     communication_matrix,_ = readCsvToNumpyMatrix(args.pe_connectivity_file)
-    computation_matrix,_ = readCsvToNumpyMatrix(args.task_execution_file)
+    computation_matrix, pkindnames = readCsvToNumpyMatrix(args.task_execution_file)
+    #computation_matrix = readCsvToPandas(args.task_execution_file)
     #mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
     #mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
 
@@ -748,7 +836,7 @@ if __name__ == "__main__":
     else:
         communication_startup = np.zeros(communication_matrix.shape[0])
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel, task_inst_names=tasknames)
+    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel, task_inst_names=tasknames, procs=procs, pkindscol=pkindnames)
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
