@@ -131,14 +131,14 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         _self.task_schedules[i] = None
     
 
-    for i in range(len(_self.communication_matrix)):
-    #for p in procs:
+    #for i in range(len(_self.communication_matrix)):
+    for p in procs:
         #logger.info(f"p: {p}")
-        #if p.id not in _self.proc_schedules:
-        if i not in _self.proc_schedules:
+        if p.id not in _self.proc_schedules:
+        #if i not in _self.proc_schedules:
             #logger.info(f"Creating proc schedule {p.id}")
-            #_self.proc_schedules[p.id] = []
-            _self.proc_schedules[i] = []
+            _self.proc_schedules[p.id] = []
+            #_self.proc_schedules[i] = []
 
     for proc in proc_schedules:
         logger.info(f"proc: {proc}")
@@ -210,18 +210,18 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
             assert "power_dict" in kwargs, "In order to perform Energy-based processor assignment, a power_dict is required"
         
         else:
-            for proc in range(len(communication_matrix)):
-            #for proc in procs:
+            #for proc in range(len(communication_matrix)):
+            for proc in procs:
                 logger.debug(f" What is a node? {type(node)} {node}")
                 taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names, pkindscol)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
         
         _self.task_schedules[node] = minTaskSchedule
-        _self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
-        _self.proc_schedules[minTaskSchedule.proc] = sorted(_self.proc_schedules[minTaskSchedule.proc], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
-        #_self.proc_schedules[minTaskSchedule.proc.id].append(minTaskSchedule)
-        #_self.proc_schedules[minTaskSchedule.proc.id] = sorted(_self.proc_schedules[minTaskSchedule.proc.id], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
+        #_self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
+        #_self.proc_schedules[minTaskSchedule.proc] = sorted(_self.proc_schedules[minTaskSchedule.proc], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
+        _self.proc_schedules[minTaskSchedule.proc.id].append(minTaskSchedule)
+        _self.proc_schedules[minTaskSchedule.proc.id] = sorted(_self.proc_schedules[minTaskSchedule.proc.id], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug('\n')
             for proc, jobs in _self.proc_schedules.items():
@@ -477,7 +477,7 @@ def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweigh
 #                commcost += mincostcommra
 #            ##
 #        ##
-        logger.info(f"Comm cost {commcost} ns")
+        #logger.debug(f"Comm cost {commcost} ns")
 #    ##
     return commcost
 
@@ -498,7 +498,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
         predjob = _self.task_schedules[prednode]
         assert predjob != None, f"Predecessor nodes must be scheduled before their children, but node {node} has an unscheduled predecessor of {prednode}"
         logger.debug(f"\tLooking at predecessor node {prednode} with job {predjob} to determine ready time")
-        if _self.communication_matrix[predjob.proc, proc] == 0:
+        if False: # _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
             commtime = _calc_comm_time(node, dag.nodes[node], prednode, dag.nodes[prednode], proc, taskdepweights, mapping, machinemodel, task_inst_names)
@@ -510,14 +510,14 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
     logger.debug(f"\tReady time determined to be {ready_time}")
 
     # improve this later by having the col with its name using pandas
-    #for i, c in enumerate(pkindscol):
-    #    if c == proc.kind.value:
-    #        colnum = i
-    #        break
+    for i, c in enumerate(pkindscol):
+        if c == proc.kind.value:
+            colnum = i
+            break
 
     #computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc.kind.value]
-    computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc]
-    job_list = _self.proc_schedules[proc]
+    computation_time = _self.computation_matrix[node-_self.numExistingJobs, colnum]
+    job_list = _self.proc_schedules[proc.id]
     for idx in range(len(job_list)):
         prev_job = job_list[idx]
         if idx == 0:
@@ -821,6 +821,7 @@ if __name__ == "__main__":
     communication_matrix,_ = readCsvToNumpyMatrix(args.pe_connectivity_file)
     computation_matrix, pkindnames = readCsvToNumpyMatrix(args.task_execution_file)
     #computation_matrix = readCsvToPandas(args.task_execution_file)
+    #pkindnames = [] # TODO remove this
     #mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
     #mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
 
