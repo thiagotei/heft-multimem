@@ -126,10 +126,11 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         #Negates any offsets that would have been needed had the jobs been relabeled
         _self.numExistingJobs = 0
 
-    logger.debug(f"task_schedules iniatilized here? {_self.task_schedules}\n numExistingJobs {_self.numExistingJobs} len comp mat : {len(_self.computation_matrix)}")
+    logger.info(f"task_schedules iniatilized here? {_self.task_schedules}\n numExistingJobs {_self.numExistingJobs} len comp mat : {len(_self.computation_matrix)}")
     for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
         _self.task_schedules[i] = None
-    
+
+    logger.info(f"[schedule_dag] {len(_self.task_schedules)} {len(computation_matrix)}")
 
     #for i in range(len(_self.communication_matrix)):
     for p in procs:
@@ -151,6 +152,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
     assert len(root_node) == 1, f"Expected a single root node, found {len(root_node)}"
     root_node = root_node[0]
     _self.root_node = root_node
+    logger.info(f"[schedule_dag] root_node: {root_node} {dag.nodes[root_node]['taskinstname']}")
 
     logger.debug(""); logger.debug("====================== Performing Rank-U Computation ======================\n"); logger.debug("")
     _compute_ranku(_self, dag, metric=rank_metric, **kwargs)
@@ -158,13 +160,16 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
     logger.debug(""); logger.debug("====================== Computing EFT for each (task, processor) pair and scheduling in order of decreasing Rank-U ======================"); logger.debug("")
     sorted_nodes = sorted(dag.nodes(), key=lambda node: dag.nodes()[node]['ranku'], reverse=True)
     if sorted_nodes[0] != root_node:
-        logger.debug("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
+        logger.critical("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
         idx = sorted_nodes.index(root_node)
         sorted_nodes[idx], sorted_nodes[0] = sorted_nodes[0], sorted_nodes[idx]
 
-    logger.debug(f"task_schedules: {_self.task_schedules}")
-    logger.debug(f"sorted_nodes: {sorted_nodes}")
+    #nx.nx_pydot.write_dot(dag, './dag_debug.dot')
+
+    #logger.info(f"\ntask_schedules:\n{_self.task_schedules}")
+    #logger.info(f"\nsorted_nodes:\n{sorted_nodes}")
     for node in sorted_nodes:
+        logger.debug(f"[schedule_dag] checking node {node} {dag.nodes[node]['taskinstname']}")
         if _self.task_schedules[node] is not None:
             continue
         minTaskSchedule = ScheduleEvent(node, inf, inf, Proc(-1, None, None, None))
@@ -212,11 +217,16 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         else:
             #for proc in range(len(communication_matrix)):
             for proc in procs:
+                #logger.info(f"[schedule_dag] comp matrix[{dag.nodes[node]['taskinstname']}, {proc.kind.value}] : {_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value]} {pd.isna(_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value])}")
+                #if mapping['mapping'][dag.nodes[node]['taskinstname']]['processor-kind'] != proc.kind.value:
+                # If processor has NaN value in the computation matrix this task should not use it
+                if pd.isna(_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value]):
+                    continue
                 logger.debug(f" What is a node? {type(node)} {node}")
                 taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names, pkindscol)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
-        
+
         _self.task_schedules[node] = minTaskSchedule
         #_self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
         #_self.proc_schedules[minTaskSchedule.proc] = sorted(_self.proc_schedules[minTaskSchedule.proc], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
@@ -261,6 +271,7 @@ def _compute_ranku(_self, dag, metric=RankMetric.MEAN, **kwargs):
     assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
     logger.info(f'terminal node {terminal_node[0]} {dag.nodes[terminal_node[0]]}')
     terminal_node = terminal_node[0]
+    node_attrs = nx.get_node_attributes(dag, "taskinstname")
 
     #TODO: Should this be configurable?
     #avgCommunicationCost = np.mean(_self.communication_matrix[np.where(_self.communication_matrix > 0)])
@@ -274,11 +285,10 @@ def _compute_ranku(_self, dag, metric=RankMetric.MEAN, **kwargs):
     # Utilize a masked array so that np.mean, etc, calculations ignore the entries that are inf
     #comp_matrix_masked = np.ma.masked_where(_self.computation_matrix == inf, _self.computation_matrix)
     comp_matrix_masked = _self.computation_matrix #.isin([np.nan, np.inf, -np.inf]).any(1)
-    logger.info(f"comp_matrix_masked {comp_matrix_masked}")
-    logger.info(f"comp_matrix_masked mean {comp_matrix_masked.loc[terminal_node-_self.numExistingJobs, 'TOC_PROC':].mean()}")
-    sys.exit(0)
+    #logger.info(f"comp_matrix_masked {comp_matrix_masked}")
+    logger.info(f"comp_matrix_masked mean {comp_matrix_masked.loc[node_attrs[terminal_node]].mean()}")
 
-    nx.set_node_attributes(dag, { terminal_node: np.mean(comp_matrix_masked.loc[terminal_node-_self.numExistingJobs]) }, "ranku")
+    nx.set_node_attributes(dag, { terminal_node: comp_matrix_masked.loc[node_attrs[terminal_node]].mean() }, "ranku")
     visit_queue = deque(dag.predecessors(terminal_node))
 
     while visit_queue:
@@ -301,8 +311,10 @@ def _compute_ranku(_self, dag, metric=RankMetric.MEAN, **kwargs):
                 if val > max_successor_ranku:
                     max_successor_ranku = val
             assert max_successor_ranku >= 0, f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}"
-            nx.set_node_attributes(dag, { node: np.mean(comp_matrix_masked[node-_self.numExistingJobs]) + max_successor_ranku }, "ranku")
-        
+            node_ranku = comp_matrix_masked.loc[node_attrs[node]].mean(skipna=True) + max_successor_ranku
+            nx.set_node_attributes(dag, { node: comp_matrix_masked.loc[node_attrs[node]].mean(skipna=True) + max_successor_ranku }, "ranku")
+            logger.debug(f"\t>>> Ranku of {node}: {dag.nodes[node]['ranku']}")
+
         elif metric == RankMetric.WORST:
             max_successor_ranku = -1
             max_node_idx = np.where(comp_matrix_masked[node-_self.numExistingJobs] == max(comp_matrix_masked[node-_self.numExistingJobs]))[0][0]
@@ -499,9 +511,12 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
         # for mem of proc:
             # if mem == mapping[node.name][ra]:
 
+    node_name = dag.nodes[node]['taskinstname']
+
     for prednode in list(dag.predecessors(node)):
         predjob = _self.task_schedules[prednode]
-        assert predjob != None, f"Predecessor nodes must be scheduled before their children, but node {node} has an unscheduled predecessor of {prednode}"
+        prednode_name = dag.nodes[prednode]['taskinstname']
+        assert predjob != None, f"Predecessor nodes must be scheduled before their children, but node {node} {node_name} has an unscheduled predecessor of {prednode} {prednode_name}"
         logger.debug(f"\tLooking at predecessor node {prednode} with job {predjob} to determine ready time")
         if False: # _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
@@ -514,14 +529,9 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
             ready_time = ready_time_t
     logger.debug(f"\tReady time determined to be {ready_time}")
 
-    # improve this later by having the col with its name using pandas
-    for i, c in enumerate(pkindscol):
-        if c == proc.kind.value:
-            colnum = i
-            break
-
     #computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc.kind.value]
-    computation_time = _self.computation_matrix[node-_self.numExistingJobs, colnum]
+    computation_time = _self.computation_matrix.loc[node_name, proc.kind.value]
+    logger.debug(f"[_compute_eft] computation_time[{node_name}, {proc.kind.value}]: {computation_time}")
     job_list = _self.proc_schedules[proc.id]
     for idx in range(len(job_list)):
         prev_job = job_list[idx]
@@ -558,7 +568,7 @@ def readCsvToPandas(csv_file):
     """
     df = pd.read_csv(csv_file)
     #print(df.dtypes)
-    logger.info(f"Reading the contents of {csv_file} into a dataframe:\n{df}")
+    logger.debug(f"Reading the contents of {csv_file} into a dataframe:\n{df}")
     return df
 
 def readCsvToNumpyMatrix(csv_file):
@@ -827,7 +837,7 @@ if __name__ == "__main__":
     #computation_matrix, pkindnames = readCsvToNumpyMatrix(args.task_execution_file)
     #"nda)
     computation_matrix = readCsvToPandas(args.task_execution_file)
-    #computation_matrix.set_index('T', inplace=True)
+    computation_matrix.set_index('T', inplace=True)
     pkindnames = [] # TODO remove this
     #mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
     #mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
@@ -844,49 +854,63 @@ if __name__ == "__main__":
     else:
         communication_startup = np.zeros(communication_matrix.shape[0])
 
-    logger.info(f"Comput matrix index?\n{computation_matrix}")
+    logger.debug(f"Comput matrix index?\n{computation_matrix}")
 
     # Check computation_matrix and dag have same nodes
     set_dag = set(x for i,x in dag.nodes(data="taskinstname"))
     #logger.info(f"set_dag: {set_dag}")
-    set_comp_mat =  set(computation_matrix['T'].tolist())
+    #set_comp_mat =  set(computation_matrix['T'].tolist())
+    set_comp_mat =  set(computation_matrix.index.values.tolist())
     #logger.info(f"set_comp_mat: {set_comp_mat}")
     diffnodes = set_dag - set_comp_mat
-    logger.info(f"diffnodes in dag not in comp_mat {diffnodes}")
+    logger.debug(f"diffnodes in dag not in comp_mat {diffnodes}")
 
     # Needs to add final to computation_matrix. It was added to the DAG but not to comp matrix.
     if 'final' in diffnodes:
-        d_row = ['final']
+        d_row = [] # ['final']
         columns = computation_matrix.columns.values.tolist()
-        columns.remove('T')
+        #columns.remove('T')
         for c in columns:
             d_row.append(1)
         logger.info(f"cols {columns} {d_row} {computation_matrix.columns}")
-        pd_1 = pd.DataFrame([d_row], columns=computation_matrix.columns)
+        pd_1 = pd.DataFrame([d_row], columns=computation_matrix.columns, index=['final'])
+        #pd_1.set_index('T', inplace=True)
         #pd_1 = pd.DataFrame([['final',1, 1]], columns=computation_matrix.columns)
         logger.info(f"pd_1 {pd_1}")
         computation_matrix = pd.concat([computation_matrix, pd_1]) #, ignore_index=True)
 
-    print("Concat:\n",computation_matrix)
-    print("final there?", computation_matrix.index[computation_matrix['T'] == 'final'].tolist())
+    #print("Concat:\n",computation_matrix)
+    #print("final there?", computation_matrix.index[computation_matrix['T'] == 'final'].tolist())
+    #print("final there?", computation_matrix.loc['final'])
 
     # Remove nodes from computation_matrix that are not in the DAG. DAG only contain nodes that have edges.
     # Needs to check why some nodes do not have edges in the dot generated by Legion Spy.
     diffnodes = set_comp_mat - set_dag
-    logger.info(f"diffnodes in comp_mat not in dag {diffnodes}")
+    logger.debug(f"diffnodes in comp_mat not in dag {diffnodes}")
     for rem in diffnodes:
-        row = computation_matrix.index[computation_matrix['T'] == rem]
-        logger.info(f"del {rem} row {row}")
+        #row = computation_matrix.index[computation_matrix['T'] == rem]
+        row = rem #computation_matrix.index[computation_matrix['T'] == rem]
+        logger.debug(f"del {rem} row {row}")
         computation_matrix.drop(row, inplace=True)
 
     set_dag = set(x for i,x in dag.nodes(data="taskinstname"))
-    set_comp_mat =  set(computation_matrix['T'].tolist())
+    #set_comp_mat =  set(computation_matrix['T'].tolist())
+    set_comp_mat =  set(computation_matrix.index.values.tolist())
     diffnodes = set_comp_mat.symmetric_difference(set_dag)
     logger.info(f"Final!!! diffnodes {diffnodes}")
 
     processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel, task_inst_names=tasknames, procs=procs, pkindscol=pkindnames)
+
+    totaltime = 0.0
     for proc, jobs in processor_schedules.items():
-        logger.info(f"Processor {proc} has the following jobs:")
-        logger.info(f"\t{jobs}")
+        logger.debug(f"Processor {proc} has the following jobs:")
+        logger.debug(f"\t{jobs}")
+        lastjobendtime = jobs[-1].end
+        logger.info(f"Processor {proc} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+        if lastjobendtime > totaltime:
+            totaltime = lastjobendtime
+
+    logger.info(f"Total result time {totaltime:.3f} ns or {totaltime*1.0e-6:.3f} ms.")
+
     if args.showGantt:
         showGanttChart(processor_schedules)
