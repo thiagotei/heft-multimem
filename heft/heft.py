@@ -44,6 +44,7 @@ class ProcKind(Enum):
 
 Proc = namedtuple('Proc', 'id kind node socket')
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
+Machine = namedtuple('Machine', 'procs nodes')
 
 """
 Default computation matrix - taken from Topcuoglu 2002 HEFT paper
@@ -74,11 +75,6 @@ C0 = np.array([
     [1, 1, 0]
 ])
 
-"""
-Default communication startup cost vector
-"""
-L0 = np.array([0, 0, 0])
-
 class RankMetric(Enum):
     MEAN = "MEAN"
     WORST = "WORST"
@@ -91,61 +87,23 @@ class OpMode(Enum):
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, mem_mem_matrix=None, mem_pe_matrix=None, mapping=None, taskdepweights=None, machinemodel=None, task_inst_names=None, procs=None, pkindscol=None, **kwargs):
+def schedule_dag(dag, linmodel, proc_schedules_inp=None, 
+                time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, 
+                mappings=None, taskdepweights=None, machine=None, task_inst_names=None, 
+                task_cost_def=1, **kwargs):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
     of that DAG onto that set of PEs 
     """
-    if proc_schedules == None:
-        proc_schedules = {}
+
+    op_mode = kwargs.get("op_mode", OpMode.EFT)
 
     _self = {
-        'computation_matrix': computation_matrix,
-        'communication_matrix': communication_matrix,
-        'communication_startup': communication_startup,
-        'mem_mem_matrix' : mem_mem_matrix,
-        'mem_pe_matrix' : mem_pe_matrix,
         'machinemodel' : machinemodel,
         'taskdepweights' : taskdepweights,
-        'task_schedules': {},
-        'proc_schedules': proc_schedules,
-        'numExistingJobs': 0,
-        'time_offset': time_offset,
         'root_node': None
     }
     _self = SimpleNamespace(**_self)
-
-    for proc in proc_schedules:
-        logger.info(f"Update num existing jobs")
-        _self.numExistingJobs = _self.numExistingJobs + len(proc_schedules[proc])
-
-    if relabel_nodes:
-        logger.info(f"Relabel nodes {relabel_nodes} {_self.numExistingJobs}")
-        dag = nx.relabel_nodes(dag, dict(map(lambda node: (node, node+_self.numExistingJobs), list(dag.nodes()))))
-    else:
-        #Negates any offsets that would have been needed had the jobs been relabeled
-        _self.numExistingJobs = 0
-
-    logger.debug(f"task_schedules iniatilized here? {_self.task_schedules}\n numExistingJobs {_self.numExistingJobs} len comp mat : {len(_self.computation_matrix)}")
-    for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
-        _self.task_schedules[i] = None
-
-    logger.debug(f"[schedule_dag] {len(_self.task_schedules)} {len(computation_matrix)}")
-
-    #for i in range(len(_self.communication_matrix)):
-    for p in procs:
-        #logger.info(f"p: {p}")
-        if p.id not in _self.proc_schedules:
-        #if i not in _self.proc_schedules:
-            #logger.info(f"Creating proc schedule {p.id}")
-            _self.proc_schedules[p.id] = []
-            #_self.proc_schedules[i] = []
-
-    for proc in proc_schedules:
-        logger.debug(f"proc: {proc}")
-        for schedule_event in proc_schedules[proc]:
-            logger.debug(f"Schedule event in proc {proc}: {schedule_event}")
-            _self.task_schedules[schedule_event.task] = schedule_event
 
     # Nodes with no successors cause the any expression to be empty    
     root_node = [node for node in dag.nodes() if not any(True for _ in dag.predecessors(node))]
@@ -154,18 +112,103 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
     _self.root_node = root_node
     logger.info(f"[schedule_dag] root_node: {root_node} {dag.nodes[root_node]['taskinstname']}")
 
-    logger.debug(""); logger.debug("====================== Performing Rank-U Computation ======================\n"); logger.debug("")
-    _compute_ranku(_self, dag, metric=rank_metric, **kwargs)
-
-    logger.debug(""); logger.debug("====================== Computing EFT for each (task, processor) pair and scheduling in order of decreasing Rank-U ======================"); logger.debug("")
-    sorted_nodes = sorted(dag.nodes(), key=lambda node: dag.nodes()[node]['ranku'], reverse=True)
-    if sorted_nodes[0] != root_node:
-        logger.critical("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
-        idx = sorted_nodes.index(root_node)
-        sorted_nodes[idx], sorted_nodes[0] = sorted_nodes[0], sorted_nodes[idx]
-
     #nx.nx_pydot.write_dot(dag, './dag_debug.dot')
 
+    for m_file, texec_file in mappings:
+        #receive mapping
+        mapping = readMapping(m_file)
+        tasktimes = tasksTimeEstimation(linmodel, mapping)
+
+        logger.debug(""); 
+        logger.debug("====================== Performing Rank-U Computation ======================\n"); 
+        logger.debug("")
+        _compute_ranku(_self, dag, metric=rank_metric, **kwargs)
+
+        logger.debug(""); 
+        logger.debug("====================== Computing EFT for each (task, processor) pair and scheduling in order of decreasing Rank-U ======================"); 
+        logger.debug("")
+        sorted_nodes = sorted(dag.nodes(), key=lambda node: dag.nodes()[node]['ranku'], reverse=True)
+
+        if sorted_nodes[0] != root_node:
+            logger.critical("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
+            idx = sorted_nodes.index(root_node)
+            sorted_nodes[idx], sorted_nodes[0] = sorted_nodes[0], sorted_nodes[idx]
+        #
+
+        if proc_schedules_inp == None:
+            proc_schedules = {}
+        else:
+            proc_schedules = copy.deepcopy(proc_schedules_inp)
+        #
+
+        _self_mapping = {
+            'computation_matrix': computation_matrix,
+            'task_schedules': {},
+            'proc_schedules': proc_schedules,
+            'numExistingJobs': 0,
+            'time_offset': time_offset,
+        }
+        _self_mapping = SimpleNamespace(**_self_mapping)
+
+        for proc in proc_schedules:
+            logger.info(f"Update num existing jobs")
+            _self_mapping.numExistingJobs = _self_mapping.numExistingJobs + len(proc_schedules[proc])
+        ##
+
+        if relabel_nodes:
+            logger.info(f"Relabel nodes {relabel_nodes} {_self_mapping.numExistingJobs}")
+            dag = nx.relabel_nodes(dag, dict(map(lambda node: (node, node+_self_mapping.numExistingJobs), list(dag.nodes()))))
+        else:
+            #Negates any offsets that would have been needed had the jobs been relabeled
+            _self_mapping.numExistingJobs = 0
+        #
+
+        logger.debug(f"task_schedules iniatilized here? {_self_mapping.task_schedules}\n" 
+                    "numExistingJobs {_self_mapping.numExistingJobs} "
+                    "len comp mat : {len(_self_mapping.computation_matrix)}")
+
+        for i in range(_self_mapping.numExistingJobs + len(_self.computation_matrix)):
+            _self_mapping.task_schedules[i] = None
+
+        logger.debug(f"[schedule_dag] {len(_self.task_schedules)} {len(computation_matrix)}")
+
+        for p in machine.procs:
+            #logger.info(f"p: {p}")
+            if p.id not in _self.proc_schedules:
+            #if i not in _self.proc_schedules:
+                #logger.info(f"Creating proc schedule {p.id}")
+                _self.proc_schedules[p.id] = []
+                #_self.proc_schedules[i] = []
+
+        for proc in proc_schedules:
+            logger.debug(f"proc: {proc}")
+            for schedule_event in proc_schedules[proc]:
+                logger.debug(f"Schedule event in proc {proc}: {schedule_event}")
+                _self.task_schedules[schedule_event.task] = schedule_event
+
+        processor_schedules, _, _ = _schedule_dag_mapping(_self_mapping, dag, machine, sorted_nodes,
+                                                        op_mode, rank_metric, task_inst_names, taskdepweights)
+
+        totaltime = 0.0
+        for proc, jobs in processor_schedules.items():
+            logger.debug(f"Processor {proc} has the following jobs:")
+            logger.debug(f"\t{jobs}")
+            lastjobendtime = jobs[-1].end
+            lastjobprockind = jobs[-1].proc.kind.value
+            logger.info(f"Processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+            if lastjobendtime > totaltime:
+                totaltime = lastjobendtime
+
+        logger.info(f"Total result time {totaltime:.3f} ns or {totaltime*1.0e-6:.3f} ms.")
+
+        if args.showGantt:
+            showGanttChart(processor_schedules)
+    ##
+
+    return the best
+###
+
+def _schedule_dag_mapping(_self, dag, sorted_nodes, machine, op_mode, rank_metric=RankMetric.MEAN, task_inst_names, taskdepweights):
     #logger.info(f"\ntask_schedules:\n{_self.task_schedules}")
     #logger.info(f"\nsorted_nodes:\n{sorted_nodes}")
     for node in sorted_nodes:
@@ -174,14 +217,12 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
             continue
         minTaskSchedule = ScheduleEvent(node, inf, inf, Proc(-1, None, None, None))
         minEDP = inf
-        op_mode = kwargs.get("op_mode", OpMode.EFT)
         if op_mode == OpMode.EDP_ABS:
             assert "power_dict" in kwargs, "In order to perform EDP-based processor assignment, a power_dict is required"
             taskschedules = []
             minScheduleStart = inf
 
-            #for proc in range(len(communication_matrix)):
-            for proc in procs:
+            for proc in machine.procs:
                 taskschedule = _compute_eft(_self, dag, node, proc)
                 edp_t = ((taskschedule.end - taskschedule.start)**2) * kwargs["power_dict"][node][proc]
                 if (edp_t < minEDP):
@@ -189,14 +230,13 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
                     minTaskSchedule = taskschedule
                 elif (edp_t == minEDP and taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
-        
+
         elif op_mode == OpMode.EDP_REL:
             assert "power_dict" in kwargs, "In order to perform EDP-based processor assignment, a power_dict is required"
             taskschedules = []
             minScheduleStart = inf
 
-            #for proc in range(len(communication_matrix)):
-            for proc in procs:
+            for proc in machine.procs:
                 taskschedules.append(_compute_eft(_self, dag, node, proc))
                 if taskschedules[proc].start < minScheduleStart:
                     minScheduleStart = taskschedules[proc].start
@@ -209,14 +249,14 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
                     minTaskSchedule = taskschedule
                 elif (edp_t == minEDP and taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
-        
+
         elif op_mode == OpMode.ENERGY:
             assert False, "Feature not implemented"
             assert "power_dict" in kwargs, "In order to perform Energy-based processor assignment, a power_dict is required"
-        
+
         else:
             # If index task launch a subset of procs will be selected
-            selprocs = procs
+            selprocs = machine.procs
 
             instname = dag.nodes[node]['taskinstname']
             taskname = 'N/A'
@@ -235,26 +275,25 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
 
                 # if index task launch is not all nodes, then all task instances of that 
                 # index task launch in node 0 for now.
-                machinenode = 0
+                selmachnode = 0
 
                 #if index task launch, select which nodes this task can run
                 if mapping['mapping'][taskname]['all_nodes']:
                     # if index task launch all nodes, split homegeneously among all nodes.
-                    tpernode = math.ceil(total / machinemodel['num_nodes'])
-                    machinenode = int(pnt / tpernode)
+                    tpernode = math.ceil(total / len(machine.nodes))
+                    selmachnode = int(pnt / tpernode)
                 #
 
                 selprocs = []
 
-                for proc in procs:
-                    if proc.node == machinenode:
+                for proc in machine.procs:
+                    if proc.node == selmachnode:
                         selprocs.append(proc)
                     #
                 ##
                 #logger.info(f"Redefining procs... {node} {taskname} {instname}\n\t{selprocs}")
             #
 
-            #for proc in range(len(communication_matrix)):
             for proc in selprocs:
             #for proc in procs:
                 #logger.info(f"Scheduling {node} {taskname} {instname} {proc}")
@@ -264,7 +303,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
                 if pd.isna(_self.computation_matrix.loc[instname, proc.kind.value]):
                     continue
 
-                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names, pkindscol)
+                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_inst_names)
                 #logger.info(f"Scheduling {node} {taskname} {instname} {proc} {taskschedule.end}")
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
@@ -296,6 +335,8 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
                 dict_output[task.task] = (proc_num, idx, [])
 
     return _self.proc_schedules, _self.task_schedules, dict_output
+
+
 
 def _scale_by_operating_freq(_self, **kwargs):
     if "operating_freqs" not in kwargs:
@@ -484,13 +525,14 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
 
         icon = machinemodel['interconnect'][p]
 
-        # latency in ms
+        # latency in ns
         lat_p = icon['latency']
         # bw in GB/s
         bw_p = icon['bandwidth']
         # bw in bytes / ns
         bw_p = bw_p
-        transfer_time +=  lat_p*1.0e6 + (datasize/bw_p)
+        #transfer_time +=  lat_p*1.0e6 + (datasize/bw_p)
+        transfer_time +=  lat_p + (datasize/bw_p)
 
     logger.debug(transfer_time)
     return transfer_time
@@ -542,7 +584,7 @@ def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweigh
 #    ##
     return commcost
 
-def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, task_inst_names, pkindscol):
+def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_inst_names):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -565,7 +607,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
         if False: # _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
-            commtime = _calc_comm_time(node, dag.nodes[node], prednode, dag.nodes[prednode], proc, taskdepweights, mapping, machinemodel, task_inst_names)
+            commtime = _calc_comm_time(node, dag.nodes[node], prednode, dag.nodes[prednode], proc, taskdepweights, mapping, machine, task_inst_names)
             #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
             ready_time_t = predjob.end + commtime
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
@@ -604,6 +646,64 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machinemodel, 
         min_schedule = ScheduleEvent(node, ready_time, ready_time + computation_time, proc)
     logger.debug(f"\tFor node {node} on processor {proc}, the EFT is {min_schedule}")
     return min_schedule    
+
+def tasktimeestimate(linmodel, mapping):
+    """Calculate computation cost for all task in mapping given.
+    """
+
+    tasktimes = {}
+    for tmap in mapping['mapping']:
+        taskname
+        pkstr = tmap["processor-kind"]
+
+        totaltime = 0
+        data_baseline = perfdata["baseline"]["baseline"]
+
+        if pkstr in data_baseline and len(data_baseline[pkstr]) > 0:
+            mkstr = next(iter(data_baseline[pkstr].keys()))
+            #print("OPA>>>>>>", mkstr," <<<<<",data_baseline[pkstr])
+
+            if taskname in data_baseline[pkstr][mkstr]:
+                taskdfmk = next(iter(data_baseline[pkstr][mkstr][taskname].values()))
+                totaltime = taskdfmk
+                logging.debug("[taskstime] Using baseline {} {} {} time {}".format(taskname, pkstr,mkstr, taskdfmk))
+            else:
+                logging.error("[taskstime] ERROR! no {} in data_baseline[{}][{}]!".format(taskname, pkstr, mkstr))
+                raise RuntimeError()
+            #
+        else:
+            logging.error("[taskstime] ERROR! no {} in data_baseline!".format(pkstr))
+            raise RuntimeError()
+        #
+
+        if "regions-used" not in tmap:
+            raise RuntimeError("[taskstime] expected regions-used in performance data!")
+        #
+
+        for regstr, mkstr in tmap["regions-used"].items():
+            if (pkstr == Processor.LOC.value or pkstr == Processor.OMP.value) and \
+                    mkstr == Memory.ZC.value:
+                mkstr = Memory.SY.value
+            #
+
+            if taskname in perfdata and \
+               regstr in perfdata[taskname] and \
+               pkstr in perfdata[taskname][regstr] and \
+               mkstr in perfdata[taskname][regstr][pkstr]:
+                val = next(iter(perfdata[taskname][regstr][pkstr][mkstr][taskname].values()))
+                adj = val - taskdfmk
+                totaltime += adj
+                logging.debug("[tasktimeestimate] Using specific {} {} {} time {} adj {} total {}".format(taskname, pkstr, mkstr, val, adj, totaltime))
+            else:
+                logging.debug("[taskstime] No timings for {} {} {} {}".format(taskname,regstr, pkstr, mkstr))
+            #
+        ##
+
+        tasktimes[taskname] = totaltime
+    ##
+    #print(perfdata) 
+    return tasktimes
+###
 
 def readCsvToPandas(csv_file):
     """
@@ -834,7 +934,8 @@ def readTaskNames(tasknames_file):
 
     return nodestasknames
 
-def createProcs(machmodel):
+def createProcs(machm_file):
+    machmodel = readMachineModel(machm_file)
     numnodes   = machmodel['num_nodes']
     numsocks   = machmodel['num_sockets_per_node']
     numcpusock = machmodel['num_cpus_per_socket']
@@ -858,89 +959,12 @@ def createProcs(machmodel):
                 nodes[n].append(p)
                 globalid += 1
 
-    return procs, nodes
-#
+    return Machine(procs, nodes)
+###
 
-def generate_argparser():
-    parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
-    parser.add_argument("-d", "--dag_file", 
-                        help="File containing input DAG to be scheduled. Uses default 10 node dag from Topcuoglu 2002 if none given.", 
-                        type=str, default="test/canonicalgraph_task_connectivity.csv")
-    parser.add_argument("-p", "--pe_connectivity_file", 
-                        help="File containing connectivity/bandwidth information about PEs. Uses a default 3x3 matrix from Topcuoglu 2002 if none given. If communication startup costs (L) are needed, a \"Startup\" row can be used as the last CSV row", 
-                        type=str, default="test/canonicalgraph_resource_BW.csv")
-    parser.add_argument("-t", "--task_execution_file", 
-                        help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Topcuoglu 2002 if none given.", 
-                        type=str, default="test/canonicalgraph_task_exe_time.csv")
-#    parser.add_argument("--memconn", type=str, required=True,
-#                        help="File containing connectivity/bandwidth information about Memory elements.")
-#    parser.add_argument("--mempe", type=str, required=True,
-#                        help="File containing connectivity between memory and processors.")
-    parser.add_argument("--mmodel", type=str, required=True, dest="machine_model_file",
-                        help="File containing the machine model.")
-    parser.add_argument("--mapping", type=str, required=True, dest="mapping_file", 
-                        help="File containing mapping decisions.")
-    parser.add_argument("--taskdepra", type=str, required=True, dest="task_dep_weights",
-                        help="File containing the machine model.")
-    parser.add_argument("--tasknames", type=str, required=True, dest="taskinstancesnames",
-                        help="File containing the task names each node represent." )
-    parser.add_argument("--indexl", type=str, required=True, dest="indexl",
-                        help="File containing the index task launch information for each dag node." )
-    parser.add_argument("-l", "--loglevel", 
-                        help="The log level to be used in this module. Default: INFO", 
-                        type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    parser.add_argument("--metric",
-                        help="Specify which metric to use when performing upward rank calculation",
-                        type=RankMetric, default=RankMetric.MEAN, dest="rank_metric", choices=list(RankMetric))
-    parser.add_argument("--showDAG", 
-                        help="Switch used to enable display of the incoming task DAG", 
-                        dest="showDAG", action="store_true")
-    parser.add_argument("--showGantt", 
-                        help="Switch used to enable display of the final scheduled Gantt chart", 
-                        dest="showGantt", action="store_true")
-    return parser
-
-if __name__ == "__main__":
-    argparser = generate_argparser()
-    args = argparser.parse_args()
-
-    logger.setLevel(logging.getLevelName(args.loglevel))
-    consolehandler = logging.StreamHandler()
-    consolehandler.setLevel(logging.getLevelName(args.loglevel))
-    consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
-    logger.addHandler(consolehandler)
-
-    #receive mapping
-    mapping = readMapping(args.mapping_file)
-    # receive taskdepcomm
-    taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
-    # machine mode desc
-    machmodel = readMachineModel(args.machine_model_file)
-    # processors data structure based on mach model
-    procs, nodes = createProcs(machmodel)
-    # nodes to task names
-    tasknames = readTaskNames(args.taskinstancesnames)
-    #logger.debug(f"tasknames:\n{tasknames}")
-    communication_matrix,_ = readCsvToNumpyMatrix(args.pe_connectivity_file)
-    #computation_matrix, pkindnames = readCsvToNumpyMatrix(args.task_execution_file)
-    #"nda)
+def readCompMatrix(taskexecfiles, dag):
     computation_matrix = readCsvToPandas(args.task_execution_file)
     computation_matrix.set_index('T', inplace=True)
-    pkindnames = [] # TODO remove this
-    #mem_pe_matrix = readCsvToNumpyMatrix(args.mempe)
-    #mem_mem_matrix = readCsvToNumpyMatrix(args.memconn)
-
-    dag = readDagMatrix(args.dag_file, args.indexl, args.showDAG)
-    # For now, the dag do not weight per region argument between task instances.
-    #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
-
-    if (communication_matrix.shape[0] != communication_matrix.shape[1]):
-        assert communication_matrix.shape[0]-1 == communication_matrix.shape[1], "If the communication_matrix CSV is non-square, there must only be a single additional row specifying the communication startup costs of each PE"
-        logger.debug("Non-square communication matrix parsed. Stripping off the last row as communication startup costs");
-        communication_startup = communication_matrix[-1, :]
-        communication_matrix = communication_matrix[0:-1, :]
-    else:
-        communication_startup = np.zeros(communication_matrix.shape[0])
 
     logger.debug(f"Comput matrix index?\n{computation_matrix}")
 
@@ -987,7 +1011,89 @@ if __name__ == "__main__":
     diffnodes = set_comp_mat.symmetric_difference(set_dag)
     logger.info(f"Final!!! diffnodes {diffnodes}")
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric, mem_mem_matrix=None, mem_pe_matrix=None, mapping=mapping,taskdepweights=taskdepcomm, machinemodel=machmodel, task_inst_names=tasknames, procs=procs, pkindscol=pkindnames)
+    return computation_matrix
+###
+
+def readLinearModel(linmodel_file)
+    # Read the linear model file
+    perfdata = None
+    with open(linmodel_file, 'r') as f:
+        data = f.read()
+        perfdata = json.loads(data)
+    #
+    return perfdata
+###
+
+def generate_argparser():
+    parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
+    parser.add_argument("-d", "--dag_file", 
+                        help="File containing input DAG to be scheduled. Uses default 10 node dag from Topcuoglu 2002 if none given.", 
+                        type=str, default="test/canonicalgraph_task_connectivity.csv")
+#    parser.add_argument("-p", "--pe_connectivity_file", 
+#                        help="File containing connectivity/bandwidth information about PEs. Uses a default 3x3 matrix from Topcuoglu 2002 if none given. If communication startup costs (L) are needed, a \"Startup\" row can be used as the last CSV row", 
+#                        type=str, default="test/canonicalgraph_resource_BW.csv")
+#    parser.add_argument("-t", "--task_execution_file", 
+#                        help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Topcuoglu 2002 if none given.", 
+#                        type=str, default="test/canonicalgraph_task_exe_time.csv")
+#    parser.add_argument("--memconn", type=str, required=True,
+#                        help="File containing connectivity/bandwidth information about Memory elements.")
+#    parser.add_argument("--mempe", type=str, required=True,
+#                        help="File containing connectivity between memory and processors.")
+    parser.add_argument("--linmodel", type=str, required=True,
+                        help="File containing linear model data for this application.")
+    parser.add_argument("--mmodel", type=str, required=True, dest="machine_model_file",
+                        help="File containing the machine model.")
+    parser.add_argument("--mapping", type=str, required=True, dest="mapping_file", 
+                        help="File containing mapping decisions.")
+    parser.add_argument("--taskdepra", type=str, required=True, dest="task_dep_weights",
+                        help="File containing the machine model.")
+    parser.add_argument("--tasknames", type=str, required=True, dest="taskinstancesnames",
+                        help="File containing the task names each node represent." )
+    parser.add_argument("--indexl", type=str, required=True, dest="indexl",
+                        help="File containing the index task launch information for each dag node." )
+    parser.add_argument("-l", "--loglevel", 
+                        help="The log level to be used in this module. Default: INFO", 
+                        type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--metric",
+                        help="Specify which metric to use when performing upward rank calculation",
+                        type=RankMetric, default=RankMetric.MEAN, dest="rank_metric", choices=list(RankMetric))
+    parser.add_argument("--showDAG", 
+                        help="Switch used to enable display of the incoming task DAG", 
+                        dest="showDAG", action="store_true")
+    parser.add_argument("--showGantt", 
+                        help="Switch used to enable display of the final scheduled Gantt chart", 
+                        dest="showGantt", action="store_true")
+    return parser
+
+if __name__ == "__main__":
+    argparser = generate_argparser()
+    args = argparser.parse_args()
+
+    logger.setLevel(logging.getLevelName(args.loglevel))
+    consolehandler = logging.StreamHandler()
+    consolehandler.setLevel(logging.getLevelName(args.loglevel))
+    consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
+    logger.addHandler(consolehandler)
+
+    #receive mapping
+    mapping = readMapping(args.mapping_files)
+    # receive taskdepcomm
+    taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
+    # processors data structure based on mach model
+    machine = createProcs(args.machine_model_file)
+    # nodes to task names
+    tasknames = readTaskNames(args.taskinstancesnames)
+    #logger.debug(f"tasknames:\n{tasknames}")
+
+    linmodel = readLinearModel(args.linmodel)
+
+    dag = readDagMatrix(args.dag_file, args.indexl, args.showDAG)
+    # For now, the dag do not weight per region argument between task instances.
+    #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
+
+    processor_schedules, _, _ = schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
+                                            mappings=mappings, taskdepweights=taskdepcomm, machine=machine, 
+                                            task_inst_names=tasknames)
 
     totaltime = 0.0
     for proc, jobs in processor_schedules.items():
