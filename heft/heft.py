@@ -1,7 +1,7 @@
 """Core code to be used for scheduling a task DAG with HEFT"""
 
 from collections import deque, namedtuple
-from math import inf
+from math import inf, ceil
 from heft.gantt import showGanttChart
 from types import SimpleNamespace
 from enum import Enum
@@ -44,7 +44,7 @@ class ProcKind(Enum):
 
 Proc = namedtuple('Proc', 'id kind node socket')
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
-Machine = namedtuple('Machine', 'procs nodes')
+Machine = namedtuple('Machine', 'procs nodes paths interconnect')
 
 """
 Default computation matrix - taken from Topcuoglu 2002 HEFT paper
@@ -99,9 +99,9 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
     op_mode = kwargs.get("op_mode", OpMode.EFT)
 
     _self = {
-        'machinemodel' : machinemodel,
+        'machine' : machine,
         'taskdepweights' : taskdepweights,
-        'root_node': None
+        'root_node': None,
     }
     _self = SimpleNamespace(**_self)
 
@@ -113,16 +113,18 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
     logger.info(f"[schedule_dag] root_node: {root_node} {dag.nodes[root_node]['taskinstname']}")
 
     #nx.nx_pydot.write_dot(dag, './dag_debug.dot')
+    bestmapping = (sys.maxsize, None, None)
 
-    for m_file, texec_file in mappings:
+    for m_file in mappings:
         #receive mapping
         mapping = readMapping(m_file)
-        tasktimes = tasksTimeEstimation(linmodel, mapping)
+        taskstime = tasksTimeCalc(linmodel, mapping)
 
+        logger.debug(f"====================== Mapping {m_file}  ======================\n"); 
         logger.debug(""); 
         logger.debug("====================== Performing Rank-U Computation ======================\n"); 
         logger.debug("")
-        _compute_ranku(_self, dag, metric=rank_metric, **kwargs)
+        _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, metric=rank_metric, **kwargs)
 
         logger.debug(""); 
         logger.debug("====================== Computing EFT for each (task, processor) pair and scheduling in order of decreasing Rank-U ======================"); 
@@ -142,11 +144,11 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
         #
 
         _self_mapping = {
-            'computation_matrix': computation_matrix,
             'task_schedules': {},
             'proc_schedules': proc_schedules,
             'numExistingJobs': 0,
             'time_offset': time_offset,
+            'taskstime' : taskstime,
         }
         _self_mapping = SimpleNamespace(**_self_mapping)
 
@@ -163,52 +165,57 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
             _self_mapping.numExistingJobs = 0
         #
 
-        logger.debug(f"task_schedules iniatilized here? {_self_mapping.task_schedules}\n" 
-                    "numExistingJobs {_self_mapping.numExistingJobs} "
-                    "len comp mat : {len(_self_mapping.computation_matrix)}")
+        logger.info(f"task_schedules iniatilized here? {_self_mapping.task_schedules}\n" 
+                    f"numExistingJobs {_self_mapping.numExistingJobs} "
+                    f"len comp mat : {len(dag.nodes())}")
 
-        for i in range(_self_mapping.numExistingJobs + len(_self.computation_matrix)):
+        for i in range(_self_mapping.numExistingJobs + len(dag.nodes())):
             _self_mapping.task_schedules[i] = None
 
-        logger.debug(f"[schedule_dag] {len(_self.task_schedules)} {len(computation_matrix)}")
+        logger.info(f"[schedule_dag] {len(_self_mapping.task_schedules)} {len(machine.procs)}")
 
         for p in machine.procs:
             #logger.info(f"p: {p}")
-            if p.id not in _self.proc_schedules:
+            if p.id not in _self_mapping.proc_schedules:
             #if i not in _self.proc_schedules:
                 #logger.info(f"Creating proc schedule {p.id}")
-                _self.proc_schedules[p.id] = []
+                _self_mapping.proc_schedules[p.id] = []
                 #_self.proc_schedules[i] = []
 
-        for proc in proc_schedules:
+        for proc in _self_mapping.proc_schedules:
             logger.debug(f"proc: {proc}")
-            for schedule_event in proc_schedules[proc]:
+            for schedule_event in _self_mapping.proc_schedules[proc]:
                 logger.debug(f"Schedule event in proc {proc}: {schedule_event}")
-                _self.task_schedules[schedule_event.task] = schedule_event
+                _self_mapping.task_schedules[schedule_event.task] = schedule_event
 
-        processor_schedules, _, _ = _schedule_dag_mapping(_self_mapping, dag, machine, sorted_nodes,
+        processor_schedules, _, _ = _schedule_dag_mapping(_self_mapping, dag, machine, sorted_nodes, mapping,
                                                         op_mode, rank_metric, task_inst_names, taskdepweights)
 
-        totaltime = 0.0
+        finaltime = 0.0
         for proc, jobs in processor_schedules.items():
             logger.debug(f"Processor {proc} has the following jobs:")
             logger.debug(f"\t{jobs}")
             lastjobendtime = jobs[-1].end
             lastjobprockind = jobs[-1].proc.kind.value
-            logger.info(f"Processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
-            if lastjobendtime > totaltime:
-                totaltime = lastjobendtime
+            logger.info(f"Mapping {m_file} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+            if lastjobendtime > finaltime:
+                finaltime = lastjobendtime
 
-        logger.info(f"Total result time {totaltime:.3f} ns or {totaltime*1.0e-6:.3f} ms.")
+        logger.info(f"Mapping {m_file} result time {finaltime:.3f} ns or {finaltime*1.0e-6:.3f} ms.")
+
+        if finaltime < bestmapping[0]:
+            bestmapping = (finaltime, m_file, processor_schedules)
+            logger.info(f"New best mapping {m_file} {finaltime}!")
+
 
         if args.showGantt:
             showGanttChart(processor_schedules)
     ##
 
-    return the best
+    return bestmapping
 ###
 
-def _schedule_dag_mapping(_self, dag, sorted_nodes, machine, op_mode, rank_metric=RankMetric.MEAN, task_inst_names, taskdepweights):
+def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, rank_metric=RankMetric.MEAN, task_inst_names=None, taskdepweights=None):
     #logger.info(f"\ntask_schedules:\n{_self.task_schedules}")
     #logger.info(f"\nsorted_nodes:\n{sorted_nodes}")
     for node in sorted_nodes:
@@ -300,10 +307,11 @@ def _schedule_dag_mapping(_self, dag, sorted_nodes, machine, op_mode, rank_metri
                 #logger.info(f"[schedule_dag] comp matrix[{dag.nodes[node]['taskinstname']}, {proc.kind.value}] : {_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value]} {pd.isna(_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value])}")
                 #if mapping['mapping'][dag.nodes[node]['taskinstname']]['processor-kind'] != proc.kind.value:
                 # If processor has NaN value in the computation matrix this task should not use it
-                if pd.isna(_self.computation_matrix.loc[instname, proc.kind.value]):
+                #if pd.isna(_self.computation_matrix.loc[instname, proc.kind.value]):
+                if taskname in mapping['mapping'] and mapping['mapping'][taskname]['processor-kind'] != proc.kind.value:
                     continue
 
-                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_inst_names)
+                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, taskname)
                 #logger.info(f"Scheduling {node} {taskname} {instname} {proc} {taskschedule.end}")
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
@@ -336,8 +344,6 @@ def _schedule_dag_mapping(_self, dag, sorted_nodes, machine, op_mode, rank_metri
 
     return _self.proc_schedules, _self.task_schedules, dict_output
 
-
-
 def _scale_by_operating_freq(_self, **kwargs):
     if "operating_freqs" not in kwargs:
         logger.debug("No operating frequency argument is present, assuming at max frequency and values are unchanged")
@@ -345,6 +351,85 @@ def _scale_by_operating_freq(_self, **kwargs):
     return #TODO
     #for pe_num, freq in enumerate(kwargs["operating_freqs"]):
         #_self.computation_matrix[:, pe_num] = _self.computation_matrix[:, pe_num] * (1 + compute_DVFS_performance_slowdown(pe_num, freq))
+
+def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, metric=RankMetric.MEAN, **kwargs):
+
+    """
+    Uses a basic BFS approach to traverse upwards through the graph assigning ranku along the way
+    """
+    terminal_node = [node for node in dag.nodes() if not any(True for _ in dag.successors(node))]
+    assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
+    logger.info(f'terminal node {terminal_node[0]} {dag.nodes[terminal_node[0]]}')
+    terminal_node = terminal_node[0]
+    node_names = nx.get_node_attributes(dag, "taskinstname")
+
+    nx.set_node_attributes(dag, { terminal_node: 1 }, "ranku")
+    visit_queue = deque(dag.predecessors(terminal_node))
+
+    logger.debug(f"\tThe ranku for node {terminal_node} is {dag.nodes()[terminal_node]['ranku']}")
+
+    while visit_queue:
+        node = visit_queue.pop()
+        while _node_can_be_processed(None, dag, node) is not True:
+            try:
+                node2 = visit_queue.pop()
+            except IndexError:
+                raise RuntimeError(f"Node {node} cannot be processed, and there are no other nodes in the queue to process instead!")
+            visit_queue.appendleft(node)
+            node = node2
+
+        logger.debug(f"Assigning ranku for node: {node}")
+
+        if metric == RankMetric.MEAN:
+            max_successor_ranku = -1
+            nodetaskname = 'N/A'
+            for succnode in dag.successors(node):
+                logger.debug(f"\tLooking at successor node: {succnode}")
+
+                weight = 1
+                if node_names[succnode] in taskdepweights:
+                    for dep in taskdepweights[node_names[succnode]]:
+                        if dep[1] == node_names[node]:
+                            pdtaskname = dep[0]
+                            nodetaskname = dep[3]
+                            ra_src = dep[2]
+                            ra_dst = dep[5]
+                            datasize = float(dep[6])
+                            ra_src_mem = mapping['mapping'][pdtaskname]['regions'][str(ra_src)]
+                            ra_dst_mem = mapping['mapping'][nodetaskname]['regions'][str(ra_dst)]
+                            src_mem = _mem_name_fix(ra_src_mem)
+                            dst_mem = _mem_name_fix(ra_dst_mem)
+                            mempath = src_mem + '_to_' + dst_mem
+ 
+                            avg = machine.paths[mempath]['avg']
+                            weight += avg['latency'] + (datasize / avg['bandwidth'])
+                        #
+                    ##
+                #
+                logger.debug(f"\tThe edge weight from node {node} to node {succnode} is {weight}, and the ranku for node {succnode} is {dag.nodes()[succnode]['ranku']}")
+
+                val = float(weight) + dag.nodes()[succnode]['ranku']
+                if val > max_successor_ranku:
+                    max_successor_ranku = val
+                #
+            ##
+
+            assert max_successor_ranku >= 0, f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}"
+
+            node_ranku = taskstime.get(nodetaskname, 1) + max_successor_ranku
+            nx.set_node_attributes(dag, { node: node_ranku }, "ranku")
+            logger.debug(f"\t>>> Ranku of {node}: {dag.nodes[node]['ranku']}")
+
+        else:
+            raise RuntimeError(f"Unrecognied Rank-U metric {metric}, unable to compute upward rank")
+        #
+
+        visit_queue.extendleft([prednode for prednode in dag.predecessors(node) if prednode not in visit_queue])
+
+    logger.debug("")
+    for node in dag.nodes():
+        logger.debug(f"Node: {node}, Rank U: {dag.nodes()[node]['ranku']}")
+###
 
 def _compute_ranku(_self, dag, metric=RankMetric.MEAN, **kwargs):
     """
@@ -397,7 +482,7 @@ def _compute_ranku(_self, dag, metric=RankMetric.MEAN, **kwargs):
                     max_successor_ranku = val
             assert max_successor_ranku >= 0, f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}"
             node_ranku = comp_matrix_masked.loc[node_attrs[node]].mean(skipna=True) + max_successor_ranku
-            nx.set_node_attributes(dag, { node: comp_matrix_masked.loc[node_attrs[node]].mean(skipna=True) + max_successor_ranku }, "ranku")
+            nx.set_node_attributes(dag, { node: node_ranku }, "ranku")
             logger.debug(f"\t>>> Ranku of {node}: {dag.nodes[node]['ranku']}")
 
         elif metric == RankMetric.WORST:
@@ -486,7 +571,7 @@ def _mem_name_fix(memname):
     #
     return name
 
-def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel):
+def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machine):
     """ Return transfer time in nanoseconds.
         Linear model numbers per task are in nanoseconds.
     """
@@ -496,22 +581,27 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
     transfer_time = 0.0
 
     # If in the same node
+    if ra_src_proc.node == ra_dst_proc.node:
         # If in the same socket
-
-    pathname = src_mem+'_to_'+dst_mem
-
-    if pathname not in machinemodel['paths']:
-        raise RuntimeError(f"Unknown {pathname} in machine model paths!")
-    #
-
-    path = machinemodel['paths'][pathname]['intra_socket']
-        # not in the same socket
-        #else
+        if ra_src_proc.socket == ra_dst_proc.socket:
+            pathname = 'intra_socket'
+        else:
+            pathname = 'inter_socket'
         #
-
-    # not in the same node
-    #else
+    else:
+        pathname = 'inter_node'
     #
+
+    mempath = src_mem+'_to_'+dst_mem
+
+    if mempath not in machine.paths:
+        raise RuntimeError(f"Unknown {mempath} in machine paths!")
+    #
+    if pathname not in machine.paths[mempath]:
+        raise RuntimeError(f"Unknown {pathname} in machine paths!")
+    #
+
+    path = machine.paths[mempath][pathname]
 
     for p in path:
         # Dual channle pci_to_host and pci_to_dev not in use yet.
@@ -519,11 +609,11 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
             p = "pci"
         #
 
-        if p not in machinemodel['interconnect']:
-            raise RuntimeError(f"Interconnect {p} not found in machine model!")
+        if p not in machine.interconnect:
+            raise RuntimeError(f"Interconnect {p} not found in machine!")
         #
 
-        icon = machinemodel['interconnect'][p]
+        icon = machine.interconnect[p]
 
         # latency in ns
         lat_p = icon['latency']
@@ -537,7 +627,7 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
     logger.debug(transfer_time)
     return transfer_time
 
-def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweights, mapping, machinemodel, task_inst_names):
+def _calc_comm_time(node, nodeattrs, proc, prednode, prednodeattrs, predproc, taskdepweights, mapping, machine):
     """
     Calculate communication cost based on the predecessor node and node according to mapping
     of overlapping region arguments.
@@ -566,7 +656,7 @@ def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweigh
                 #print(pdtaskname,ra_src,ra_src_mem, nodetaskname, ra_dst, ra_dst_mem, datasize, type(datasize))
                 #commcost += datasize*(1/10)
                 #commcost += _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel)
-                commcost += _transfer_time(None, ra_src_mem, None, ra_dst_mem, datasize, machinemodel)
+                commcost += _transfer_time(predproc, ra_src_mem, proc, ra_dst_mem, datasize, machine)
 #                mincostcommra = sys.maxsize
 #                bestmem = None
 #                for mem in machinemodel[proc].memories:
@@ -584,7 +674,7 @@ def _calc_comm_time(node, nodeattrs, prednode, prednodeattrs, proc, taskdepweigh
 #    ##
     return commcost
 
-def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_inst_names):
+def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodetaskname):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -607,7 +697,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_
         if False: # _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
-            commtime = _calc_comm_time(node, dag.nodes[node], prednode, dag.nodes[prednode], proc, taskdepweights, mapping, machine, task_inst_names)
+            commtime = _calc_comm_time(node, dag.nodes[node], proc, prednode, dag.nodes[prednode], predjob.proc, taskdepweights, mapping, machine)
             #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
             ready_time_t = predjob.end + commtime
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
@@ -616,7 +706,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_
     logger.debug(f"\tReady time determined to be {ready_time}")
 
     #computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc.kind.value]
-    computation_time = _self.computation_matrix.loc[node_name, proc.kind.value]
+    computation_time = _self.taskstime.get(nodetaskname, 1) #_self.computation_matrix.loc[node_name, proc.kind.value]
     logger.debug(f"[_compute_eft] computation_time[{node_name}, {proc.kind.value}]: {computation_time}")
     job_list = _self.proc_schedules[proc.id]
     for idx in range(len(job_list)):
@@ -647,17 +737,16 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, task_
     logger.debug(f"\tFor node {node} on processor {proc}, the EFT is {min_schedule}")
     return min_schedule    
 
-def tasktimeestimate(linmodel, mapping):
-    """Calculate computation cost for all task in mapping given.
+def tasksTimeCalc(linmodel, mapping):
+    """Calculate computation cost for all tasks in a given according to linear model.
     """
 
-    tasktimes = {}
-    for tmap in mapping['mapping']:
-        taskname
+    taskstime = {}
+    for taskname, tmap in mapping['mapping'].items():
         pkstr = tmap["processor-kind"]
 
         totaltime = 0
-        data_baseline = perfdata["baseline"]["baseline"]
+        data_baseline = linmodel["baseline"]["baseline"]
 
         if pkstr in data_baseline and len(data_baseline[pkstr]) > 0:
             mkstr = next(iter(data_baseline[pkstr].keys()))
@@ -666,13 +755,13 @@ def tasktimeestimate(linmodel, mapping):
             if taskname in data_baseline[pkstr][mkstr]:
                 taskdfmk = next(iter(data_baseline[pkstr][mkstr][taskname].values()))
                 totaltime = taskdfmk
-                logging.debug("[taskstime] Using baseline {} {} {} time {}".format(taskname, pkstr,mkstr, taskdfmk))
+                logger.debug("[taskstime] Using baseline {} {} {} time {}".format(taskname, pkstr,mkstr, taskdfmk))
             else:
-                logging.error("[taskstime] ERROR! no {} in data_baseline[{}][{}]!".format(taskname, pkstr, mkstr))
+                logger.error("[taskstime] ERROR! no {} in data_baseline[{}][{}]!".format(taskname, pkstr, mkstr))
                 raise RuntimeError()
             #
         else:
-            logging.error("[taskstime] ERROR! no {} in data_baseline!".format(pkstr))
+            logger.error("[taskstime] ERROR! no {} in data_baseline!".format(pkstr))
             raise RuntimeError()
         #
 
@@ -681,28 +770,28 @@ def tasktimeestimate(linmodel, mapping):
         #
 
         for regstr, mkstr in tmap["regions-used"].items():
-            if (pkstr == Processor.LOC.value or pkstr == Processor.OMP.value) and \
-                    mkstr == Memory.ZC.value:
-                mkstr = Memory.SY.value
+            if (pkstr == ProcKind.LOC.value or pkstr == ProcKind.OMP.value) and \
+                    mkstr == MemKind.ZC.value:
+                mkstr = MemKind.SY.value
             #
 
-            if taskname in perfdata and \
-               regstr in perfdata[taskname] and \
-               pkstr in perfdata[taskname][regstr] and \
-               mkstr in perfdata[taskname][regstr][pkstr]:
-                val = next(iter(perfdata[taskname][regstr][pkstr][mkstr][taskname].values()))
+            if taskname in linmodel and \
+               regstr in linmodel[taskname] and \
+               pkstr in linmodel[taskname][regstr] and \
+               mkstr in linmodel[taskname][regstr][pkstr]:
+                val = next(iter(linmodel[taskname][regstr][pkstr][mkstr][taskname].values()))
                 adj = val - taskdfmk
                 totaltime += adj
-                logging.debug("[tasktimeestimate] Using specific {} {} {} time {} adj {} total {}".format(taskname, pkstr, mkstr, val, adj, totaltime))
+                logger.debug("[tasktimeestimate] Using specific {} {} {} time {} adj {} total {}".format(taskname, pkstr, mkstr, val, adj, totaltime))
             else:
-                logging.debug("[taskstime] No timings for {} {} {} {}".format(taskname,regstr, pkstr, mkstr))
+                logger.debug("[taskstime] No timings for {} {} {} {}".format(taskname,regstr, pkstr, mkstr))
             #
         ##
 
-        tasktimes[taskname] = totaltime
+        taskstime[taskname] = totaltime
     ##
     #print(perfdata) 
-    return tasktimes
+    return taskstime
 ###
 
 def readCsvToPandas(csv_file):
@@ -958,8 +1047,40 @@ def createProcs(machm_file):
                 procs.append(p)
                 nodes[n].append(p)
                 globalid += 1
+            ##
+        ##
+    ##
 
-    return Machine(procs, nodes)
+    # Calculate avarages that will be used by ranku per path.
+    for mempath, loc in machmodel['paths'].items():
+        # mempath: mem <-> mem; loc: intra-sock,inter-sock, inter-node
+        avgs = {'latency' : 0, 'bandwidth' : 0 }
+        for locname, path in loc.items():
+            p_avg_bw = 0
+            for p in path:
+                if p.startswith('pci'):
+                    p = 'pci'
+                #
+                logger.debug(f"{mempath} {locname} {path} lat: {avgs['latency']} {machmodel['interconnect'][p]['latency']} bw: {p_avg_bw}")
+                avgs['latency'] += machmodel['interconnect'][p]['latency']
+                p_avg_bw += machmodel['interconnect'][p]['bandwidth']
+            ##
+            avgs['bandwidth'] += p_avg_bw / len(path) 
+            logger.debug(f"{mempath} {locname} bw: {avgs['bandwidth']}")
+        ##
+        # Latency is not averaged in the path, it accumulates
+        # Latency avereges among paths.
+        avgs['latency']   /= len(loc)
+        avgs['latency']    = int(ceil(avgs['latency']))
+        # Bandwidth averaged in the path, and then again among paths.
+        avgs['bandwidth'] /= len(loc)
+
+        machmodel['paths'][mempath]['avg'] = avgs
+    ##
+
+    logger.debug(json.dumps(machmodel, indent=2))
+
+    return Machine(procs, nodes, machmodel['paths'], machmodel['interconnect'])
 ###
 
 def readCompMatrix(taskexecfiles, dag):
@@ -1014,7 +1135,7 @@ def readCompMatrix(taskexecfiles, dag):
     return computation_matrix
 ###
 
-def readLinearModel(linmodel_file)
+def readLinearModel(linmodel_file):
     # Read the linear model file
     perfdata = None
     with open(linmodel_file, 'r') as f:
@@ -1043,7 +1164,7 @@ def generate_argparser():
                         help="File containing linear model data for this application.")
     parser.add_argument("--mmodel", type=str, required=True, dest="machine_model_file",
                         help="File containing the machine model.")
-    parser.add_argument("--mapping", type=str, required=True, dest="mapping_file", 
+    parser.add_argument("--mappings", type=str, nargs='+', required=True, dest="mapping_files", 
                         help="File containing mapping decisions.")
     parser.add_argument("--taskdepra", type=str, required=True, dest="task_dep_weights",
                         help="File containing the machine model.")
@@ -1075,8 +1196,6 @@ if __name__ == "__main__":
     consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
     logger.addHandler(consolehandler)
 
-    #receive mapping
-    mapping = readMapping(args.mapping_files)
     # receive taskdepcomm
     taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
     # processors data structure based on mach model
@@ -1091,8 +1210,8 @@ if __name__ == "__main__":
     # For now, the dag do not weight per region argument between task instances.
     #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
 
-    processor_schedules, _, _ = schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
-                                            mappings=mappings, taskdepweights=taskdepcomm, machine=machine, 
+    besttime, best_mfile, processor_schedules= schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
+                                            mappings=args.mapping_files, taskdepweights=taskdepcomm, machine=machine, 
                                             task_inst_names=tasknames)
 
     totaltime = 0.0
@@ -1101,11 +1220,11 @@ if __name__ == "__main__":
         logger.debug(f"\t{jobs}")
         lastjobendtime = jobs[-1].end
         lastjobprockind = jobs[-1].proc.kind.value
-        logger.info(f"Processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+        logger.info(f"Mapping {best_mfile} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
         if lastjobendtime > totaltime:
             totaltime = lastjobendtime
 
-    logger.info(f"Total result time {totaltime:.3f} ns or {totaltime*1.0e-6:.3f} ms.")
+    logger.info(f"Best mapping {best_mfile} final result time {totaltime:.3f} ns or {totaltime*1.0e-6:.3f} ms.")
 
     if args.showGantt:
         showGanttChart(processor_schedules)
