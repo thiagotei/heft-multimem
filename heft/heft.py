@@ -431,112 +431,6 @@ def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, met
         logger.debug(f"Node: {node}, Rank U: {dag.nodes()[node]['ranku']}")
 ###
 
-def _compute_ranku(_self, dag, metric=RankMetric.MEAN, **kwargs):
-    """
-    Uses a basic BFS approach to traverse upwards through the graph assigning ranku along the way
-    """
-    terminal_node = [node for node in dag.nodes() if not any(True for _ in dag.successors(node))]
-    assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
-    logger.info(f'terminal node {terminal_node[0]} {dag.nodes[terminal_node[0]]}')
-    terminal_node = terminal_node[0]
-    node_attrs = nx.get_node_attributes(dag, "taskinstname")
-
-    #TODO: Should this be configurable?
-    #avgCommunicationCost = np.mean(_self.communication_matrix[np.where(_self.communication_matrix > 0)])
-    diagonal_mask = np.ones(_self.communication_matrix.shape, dtype=bool)
-    np.fill_diagonal(diagonal_mask, 0)
-    avgCommunicationCost = np.mean(_self.communication_matrix[diagonal_mask]) + np.mean(_self.communication_startup)
-    for edge in dag.edges():
-        logger.debug(f"Assigning {edge}'s average weight based on average communication cost. {float(dag.get_edge_data(*edge)['weight'])} => {float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost}")
-        nx.set_edge_attributes(dag, { edge: float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost }, 'avgweight')
-
-    # Utilize a masked array so that np.mean, etc, calculations ignore the entries that are inf
-    #comp_matrix_masked = np.ma.masked_where(_self.computation_matrix == inf, _self.computation_matrix)
-    comp_matrix_masked = _self.computation_matrix #.isin([np.nan, np.inf, -np.inf]).any(1)
-    #logger.info(f"comp_matrix_masked {comp_matrix_masked}")
-    logger.info(f"comp_matrix_masked mean {comp_matrix_masked.loc[node_attrs[terminal_node]].mean()}")
-
-    nx.set_node_attributes(dag, { terminal_node: comp_matrix_masked.loc[node_attrs[terminal_node]].mean() }, "ranku")
-    visit_queue = deque(dag.predecessors(terminal_node))
-
-    logger.debug(f"\tThe ranku for node {terminal_node} is {dag.nodes()[terminal_node]['ranku']}")
-
-    while visit_queue:
-        node = visit_queue.pop()
-        while _node_can_be_processed(_self, dag, node) is not True:
-            try:
-                node2 = visit_queue.pop()
-            except IndexError:
-                raise RuntimeError(f"Node {node} cannot be processed, and there are no other nodes in the queue to process instead!")
-            visit_queue.appendleft(node)
-            node = node2
-
-        logger.debug(f"Assigning ranku for node: {node}")
-        if metric == RankMetric.MEAN:
-            max_successor_ranku = -1
-            for succnode in dag.successors(node):
-                logger.debug(f"\tLooking at successor node: {succnode}")
-                logger.debug(f"\tThe edge weight from node {node} to node {succnode} is {dag[node][succnode]['avgweight']}, and the ranku for node {succnode} is {dag.nodes()[succnode]['ranku']}")
-                val = float(dag[node][succnode]['avgweight']) + dag.nodes()[succnode]['ranku']
-                if val > max_successor_ranku:
-                    max_successor_ranku = val
-            assert max_successor_ranku >= 0, f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}"
-            node_ranku = comp_matrix_masked.loc[node_attrs[node]].mean(skipna=True) + max_successor_ranku
-            nx.set_node_attributes(dag, { node: node_ranku }, "ranku")
-            logger.debug(f"\t>>> Ranku of {node}: {dag.nodes[node]['ranku']}")
-
-        elif metric == RankMetric.WORST:
-            max_successor_ranku = -1
-            max_node_idx = np.where(comp_matrix_masked[node-_self.numExistingJobs] == max(comp_matrix_masked[node-_self.numExistingJobs]))[0][0]
-            logger.debug(f"\tNode {node} has maximum computation cost of {comp_matrix_masked[node-_self.numExistingJobs][max_node_idx]} on processor {max_node_idx}")
-            for succnode in dag.successors(node):
-                logger.debug(f"\tLooking at successor node: {succnode}")
-                max_succ_idx = np.where(comp_matrix_masked[succnode-_self.numExistingJobs] == max(comp_matrix_masked[succnode-_self.numExistingJobs]))[0][0]
-                logger.debug(f"\tNode {succnode} has maximum computation cost of {comp_matrix_masked[succnode-_self.numExistingJobs][max_succ_idx]} on processor {max_succ_idx}")
-                val = _self.communication_matrix[max_node_idx, max_succ_idx] + dag.nodes()[succnode]['ranku']
-                if val > max_successor_ranku:
-                    max_successor_ranku = val
-            assert max_successor_ranku >= 0, f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}"
-            nx.set_node_attributes(dag, { node: comp_matrix_masked[node-_self.numExistingJobs, max_node_idx] + max_successor_ranku}, "ranku")
-        
-        elif metric == RankMetric.BEST:
-            min_successor_ranku = inf
-            min_node_idx = np.where(comp_matrix_masked[node-_self.numExistingJobs] == min(comp_matrix_masked[node-_self.numExistingJobs]))[0][0]
-            logger.debug(f"\tNode {node} has minimum computation cost on processor {min_node_idx}")
-            for succnode in dag.successors(node):
-                logger.debug(f"\tLooking at successor node: {succnode}")
-                min_succ_idx = np.where(comp_matrix_masked[succnode-_self.numExistingJobs] == min(comp_matrix_masked[succnode-_self.numExistingJobs]))[0][0]
-                logger.debug(f"\tThis successor node has minimum computation cost on processor {min_succ_idx}")
-                val = _self.communication_matrix[min_node_idx, min_succ_idx] + dag.nodes()[succnode]['ranku']
-                if val < min_successor_ranku:
-                    min_successor_ranku = val
-            assert min_successor_ranku >= 0, f"Expected minimum successor ranku to be greater or equal to 0 but was {min_successor_ranku}"
-            nx.set_node_attributes(dag, { node: comp_matrix_masked[node-_self.numExistingJobs, min_node_idx] + min_successor_ranku}, "ranku")
-        
-        elif metric == RankMetric.EDP:
-            assert "power_dict" in kwargs, "In order to perform EDP-based Rank Method, a power_dict is required"
-            power_dict = kwargs.get("power_dict", np.array([[]]))
-            power_dict_masked = np.ma.masked_where(power_dict[node] == inf, power_dict[node])
-            max_successor_ranku = -1
-            for succnode in dag.successors(node):
-                logger.debug(f"\tLooking at successor node: {succnode}")
-                logger.debug(f"\tThe edge weight from node {node} to node {succnode} is {dag[node][succnode]['avgweight']}, and the ranku for node {node} is {dag.nodes()[succnode]['ranku']}")
-                val = float(dag[node][succnode]['avgweight']) + dag.nodes()[succnode]['ranku']
-                if val > max_successor_ranku:
-                    max_successor_ranku = val
-            assert max_successor_ranku >= 0, f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}"
-            avg_edp = np.mean(comp_matrix_masked[node-_self.numExistingJobs])**2 * np.mean(power_dict_masked)
-            nx.set_node_attributes(dag, { node: avg_edp + max_successor_ranku }, "ranku")
-        
-        else:
-            raise RuntimeError(f"Unrecognied Rank-U metric {metric}, unable to compute upward rank")
-
-        visit_queue.extendleft([prednode for prednode in dag.predecessors(node) if prednode not in visit_queue])
-    
-    logger.debug("")
-    for node in dag.nodes():
-        logger.debug(f"Node: {node}, Rank U: {dag.nodes()[node]['ranku']}")
-
 def _node_can_be_processed(_self, dag, node):
     """
     Validates that a node is able to be processed in Rank U calculations. Namely, that all of its successors have their Rank U values properly assigned
@@ -794,16 +688,6 @@ def tasksTimeCalc(linmodel, mapping):
     return taskstime
 ###
 
-def readCsvToPandas(csv_file):
-    """
-    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
-    this function reads that data into a numpy matrix and strips the top row and leftmost column
-    """
-    df = pd.read_csv(csv_file)
-    #print(df.dtypes)
-    logger.debug(f"Reading the contents of {csv_file} into a dataframe:\n{df}")
-    return df
-
 def readCsvToNumpyMatrix(csv_file):
     """
     Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
@@ -825,19 +709,6 @@ def readCsvToNumpyMatrix(csv_file):
         logger.debug(f"Nodenames:\n{nodenames}")
         logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
         return matrix, nodenames
-
-def readCsvToDict(csv_file):
-    """
-    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
-    this function reads that data into a dictionary with keys that are node numbers and values that are the CSV lists
-    """
-    with open(csv_file) as fd:
-        matrix = readCsvToNumpyMatrix(csv_file)
-        
-        outputDict = {}
-        for row_num, row in enumerate(matrix):
-            outputDict[row_num] = row
-        return outputDict
 
 def readDagMatrix(dag_file, itlfile, show_dag=False):
     """
@@ -897,25 +768,6 @@ def readDagMatrix(dag_file, itlfile, show_dag=False):
         plt.show()
 
     return dag
-
-def readMultiCsvToNumpyMatrix(csv_file):
-    """
-    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
-    this function reads that data into a numpy matrix and strips the top row and leftmost column
-    """
-    with open(csv_file) as fd:
-        logger.debug(f"Reading the contents of {csv_file} into a matrix")
-        contents = fd.read()
-        contentsList = contents.split('\n')
-        contentsList = list(map(lambda line: line.split(','), contentsList))
-        contentsList = list(filter(lambda arr: arr != [''], contentsList))
-        
-        matrix = np.array(contentsList)
-        matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
-        matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
-        matrix = matrix.astype(float)
-        logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
-        return matrix
 
 def readMultiDagMatrix(dag_file, show_dag=False):
     """
@@ -1083,58 +935,6 @@ def createProcs(machm_file):
     return Machine(procs, nodes, machmodel['paths'], machmodel['interconnect'])
 ###
 
-def readCompMatrix(taskexecfiles, dag):
-    computation_matrix = readCsvToPandas(args.task_execution_file)
-    computation_matrix.set_index('T', inplace=True)
-
-    logger.debug(f"Comput matrix index?\n{computation_matrix}")
-
-    # Check computation_matrix and dag have same nodes
-    set_dag = set(x for i,x in dag.nodes(data="taskinstname"))
-    #logger.info(f"set_dag: {set_dag}")
-    #set_comp_mat =  set(computation_matrix['T'].tolist())
-    set_comp_mat =  set(computation_matrix.index.values.tolist())
-    #logger.info(f"set_comp_mat: {set_comp_mat}")
-    diffnodes = set_dag - set_comp_mat
-    logger.debug(f"diffnodes in dag not in comp_mat {diffnodes}")
-
-    # Needs to add final to computation_matrix. It was added to the DAG but not to comp matrix.
-    if 'final' in diffnodes:
-        d_row = [] # ['final']
-        columns = computation_matrix.columns.values.tolist()
-        #columns.remove('T')
-        for c in columns:
-            d_row.append(1)
-        logger.info(f"cols {columns} {d_row} {computation_matrix.columns}")
-        pd_1 = pd.DataFrame([d_row], columns=computation_matrix.columns, index=['final'])
-        #pd_1.set_index('T', inplace=True)
-        #pd_1 = pd.DataFrame([['final',1, 1]], columns=computation_matrix.columns)
-        logger.info(f"pd_1 {pd_1}")
-        computation_matrix = pd.concat([computation_matrix, pd_1]) #, ignore_index=True)
-
-    #print("Concat:\n",computation_matrix)
-    #print("final there?", computation_matrix.index[computation_matrix['T'] == 'final'].tolist())
-    #print("final there?", computation_matrix.loc['final'])
-
-    # Remove nodes from computation_matrix that are not in the DAG. DAG only contain nodes that have edges.
-    # Needs to check why some nodes do not have edges in the dot generated by Legion Spy.
-    diffnodes = set_comp_mat - set_dag
-    logger.debug(f"diffnodes in comp_mat not in dag {diffnodes}")
-    for rem in diffnodes:
-        #row = computation_matrix.index[computation_matrix['T'] == rem]
-        row = rem #computation_matrix.index[computation_matrix['T'] == rem]
-        logger.debug(f"del {rem} row {row}")
-        computation_matrix.drop(row, inplace=True)
-
-    set_dag = set(x for i,x in dag.nodes(data="taskinstname"))
-    #set_comp_mat =  set(computation_matrix['T'].tolist())
-    set_comp_mat =  set(computation_matrix.index.values.tolist())
-    diffnodes = set_comp_mat.symmetric_difference(set_dag)
-    logger.info(f"Final!!! diffnodes {diffnodes}")
-
-    return computation_matrix
-###
-
 def readLinearModel(linmodel_file):
     # Read the linear model file
     perfdata = None
@@ -1150,16 +950,6 @@ def generate_argparser():
     parser.add_argument("-d", "--dag_file", 
                         help="File containing input DAG to be scheduled. Uses default 10 node dag from Topcuoglu 2002 if none given.", 
                         type=str, default="test/canonicalgraph_task_connectivity.csv")
-#    parser.add_argument("-p", "--pe_connectivity_file", 
-#                        help="File containing connectivity/bandwidth information about PEs. Uses a default 3x3 matrix from Topcuoglu 2002 if none given. If communication startup costs (L) are needed, a \"Startup\" row can be used as the last CSV row", 
-#                        type=str, default="test/canonicalgraph_resource_BW.csv")
-#    parser.add_argument("-t", "--task_execution_file", 
-#                        help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Topcuoglu 2002 if none given.", 
-#                        type=str, default="test/canonicalgraph_task_exe_time.csv")
-#    parser.add_argument("--memconn", type=str, required=True,
-#                        help="File containing connectivity/bandwidth information about Memory elements.")
-#    parser.add_argument("--mempe", type=str, required=True,
-#                        help="File containing connectivity between memory and processors.")
     parser.add_argument("--linmodel", type=str, required=True,
                         help="File containing linear model data for this application.")
     parser.add_argument("--mmodel", type=str, required=True, dest="machine_model_file",
@@ -1220,7 +1010,7 @@ if __name__ == "__main__":
         logger.debug(f"\t{jobs}")
         lastjobendtime = jobs[-1].end
         lastjobprockind = jobs[-1].proc.kind.value
-        logger.info(f"Mapping {best_mfile} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+        logger.debug(f"Mapping {best_mfile} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
         if lastjobendtime > totaltime:
             totaltime = lastjobendtime
 
