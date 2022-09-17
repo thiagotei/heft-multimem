@@ -2,18 +2,19 @@
 
 from collections import deque, namedtuple
 from math import inf, ceil
-from heft.gantt import showGanttChart
+from heft.gantt import showGanttChart, saveGanttChart
 from types import SimpleNamespace
 from enum import Enum
 
 import argparse
 import logging
-import json
+import json, os
 import sys, csv
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
+import time
 
 logger = logging.getLogger('heft')
 
@@ -87,6 +88,14 @@ class OpMode(Enum):
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
 
+def updateLoggerLevel(l):
+    origlevel = logger.getEffectiveLevel()
+    logger.setLevel(l)
+    for h in logger.handlers:
+        h.setLevel(l)
+    return origlevel
+###
+
 def schedule_dag(dag, linmodel, proc_schedules_inp=None, 
                 time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, 
                 mappings=None, taskdepweights=None, machine=None, task_inst_names=None, 
@@ -105,24 +114,28 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
     }
     _self = SimpleNamespace(**_self)
 
+    nx.nx_pydot.write_dot(dag, './dag_debug.dot')
+
     # Nodes with no successors cause the any expression to be empty    
     root_node = [node for node in dag.nodes() if not any(True for _ in dag.predecessors(node))]
     assert len(root_node) == 1, f"Expected a single root node, found {len(root_node)}"
     root_node = root_node[0]
     _self.root_node = root_node
-    logger.info(f"[schedule_dag] root_node: {root_node} {dag.nodes[root_node]['taskinstname']}")
+    logger.debug(f"[schedule_dag] root_node: {root_node} {dag.nodes[root_node]['taskinstname']}")
 
-    #nx.nx_pydot.write_dot(dag, './dag_debug.dot')
+    num_mappings = len(mappings)
     bestmapping = (sys.maxsize, None, None)
 
-    for m_file in mappings:
+    for m_i, m_file in enumerate(mappings):
         #receive mapping
         mapping = readMapping(m_file)
         taskstime = tasksTimeCalc(linmodel, mapping)
+        m_iter = mapping['iteration']
 
-        logger.debug(f"====================== Mapping {m_file}  ======================\n"); 
+        logger.info(f"====================== Mapping {m_iter} {m_file} {m_i}/{num_mappings} ======================"); 
         logger.debug(""); 
-        logger.debug("====================== Performing Rank-U Computation ======================\n"); 
+        logger.info(f"Tasks time:\n{json.dumps(taskstime, indent=2, sort_keys=True)}")
+        logger.debug("====================== Performing Rank-U Computation ======================"); 
         logger.debug("")
         _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, metric=rank_metric, **kwargs)
 
@@ -149,30 +162,31 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
             'numExistingJobs': 0,
             'time_offset': time_offset,
             'taskstime' : taskstime,
+            'totalcomm' : 0.0
         }
         _self_mapping = SimpleNamespace(**_self_mapping)
 
         for proc in proc_schedules:
-            logger.info(f"Update num existing jobs")
+            logger.debug(f"Update num existing jobs")
             _self_mapping.numExistingJobs = _self_mapping.numExistingJobs + len(proc_schedules[proc])
         ##
 
         if relabel_nodes:
-            logger.info(f"Relabel nodes {relabel_nodes} {_self_mapping.numExistingJobs}")
+            logger.debug(f"Relabel nodes {relabel_nodes} {_self_mapping.numExistingJobs}")
             dag = nx.relabel_nodes(dag, dict(map(lambda node: (node, node+_self_mapping.numExistingJobs), list(dag.nodes()))))
         else:
             #Negates any offsets that would have been needed had the jobs been relabeled
             _self_mapping.numExistingJobs = 0
         #
 
-        logger.info(f"task_schedules iniatilized here? {_self_mapping.task_schedules}\n" 
+        logger.debug(f"task_schedules iniatilized here? {_self_mapping.task_schedules}\n" 
                     f"numExistingJobs {_self_mapping.numExistingJobs} "
                     f"len comp mat : {len(dag.nodes())}")
 
         for i in range(_self_mapping.numExistingJobs + len(dag.nodes())):
             _self_mapping.task_schedules[i] = None
 
-        logger.info(f"[schedule_dag] {len(_self_mapping.task_schedules)} {len(machine.procs)}")
+        logger.debug(f"[schedule_dag] {len(_self_mapping.task_schedules)} {len(machine.procs)}")
 
         for p in machine.procs:
             #logger.info(f"p: {p}")
@@ -197,19 +211,27 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
             logger.debug(f"\t{jobs}")
             lastjobendtime = jobs[-1].end
             lastjobprockind = jobs[-1].proc.kind.value
-            logger.info(f"Mapping {m_file} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+            if args.pproc:
+                logger.info(f"Mapping {m_file} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
             if lastjobendtime > finaltime:
                 finaltime = lastjobendtime
 
-        logger.info(f"Mapping {m_file} result time {finaltime:.3f} ns or {finaltime*1.0e-6:.3f} ms.")
+        logger.info(f"Total comm {_self_mapping.totalcomm} ns or {_self_mapping.totalcomm*1.0e-6:.3f} ms.")
+        logger.info(f"Mapping {mapping['iteration']} {m_file} result time {finaltime:.3f} ns or {finaltime*1.0e-6:.3f} ms.")
 
         if finaltime < bestmapping[0]:
             bestmapping = (finaltime, m_file, processor_schedules)
             logger.info(f"New best mapping {m_file} {finaltime}!")
 
-
         if args.showGantt:
             showGanttChart(processor_schedules)
+
+        if args.saveGantt:
+            #m = os.path.basename(m_file).split('.')[0] # remove path and extension
+            m = str(m_iter)
+            gfname = 'gannt_mapping_'+m+'.png'
+            saveGanttChart(processor_schedules, machine, gfname, "Mapping "+m)
+            logger.info(f"Save Gantt for {m_file} into {gfname}!")
     ##
 
     return bestmapping
@@ -218,6 +240,8 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
 def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, rank_metric=RankMetric.MEAN, task_inst_names=None, taskdepweights=None):
     #logger.info(f"\ntask_schedules:\n{_self.task_schedules}")
     #logger.info(f"\nsorted_nodes:\n{sorted_nodes}")
+    nodeacct = {}
+
     for node in sorted_nodes:
         logger.debug(f"[schedule_dag] checking node {node} {dag.nodes[node]['taskinstname']}")
         if _self.task_schedules[node] is not None:
@@ -301,6 +325,12 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
                 #logger.info(f"Redefining procs... {node} {taskname} {instname}\n\t{selprocs}")
             #
 
+            if taskname in nodeacct:
+                nodeacct[taskname] += 1
+            else:
+                nodeacct[taskname] = 1
+            #
+
             for proc in selprocs:
             #for proc in procs:
                 #logger.info(f"Scheduling {node} {taskname} {instname} {proc}")
@@ -342,6 +372,8 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
             else:
                 dict_output[task.task] = (proc_num, idx, [])
 
+    logger.info(f"Node acct:\n{json.dumps(nodeacct, indent=2, sort_keys=True)}")
+
     return _self.proc_schedules, _self.task_schedules, dict_output
 
 def _scale_by_operating_freq(_self, **kwargs):
@@ -359,7 +391,7 @@ def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, met
     """
     terminal_node = [node for node in dag.nodes() if not any(True for _ in dag.successors(node))]
     assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
-    logger.info(f'terminal node {terminal_node[0]} {dag.nodes[terminal_node[0]]}')
+    logger.debug(f'terminal node {terminal_node[0]} {dag.nodes[terminal_node[0]]}')
     terminal_node = terminal_node[0]
     node_names = nx.get_node_attributes(dag, "taskinstname")
 
@@ -426,9 +458,12 @@ def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, met
 
         visit_queue.extendleft([prednode for prednode in dag.predecessors(node) if prednode not in visit_queue])
 
-    logger.debug("")
-    for node in dag.nodes():
-        logger.debug(f"Node: {node}, Rank U: {dag.nodes()[node]['ranku']}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("")
+        for node in dag.nodes():
+            logger.debug(f"Node: {node}, Rank U: {dag.nodes()[node]['ranku']}")
+        ##
+    #
 ###
 
 def _node_can_be_processed(_self, dag, node):
@@ -534,6 +569,7 @@ def _calc_comm_time(node, nodeattrs, proc, prednode, prednodeattrs, predproc, ta
 
     nodename = nodeattrs["taskinstname"]
     prednodename = prednodeattrs["taskinstname"]
+    total_datasize = 0
 
     if nodename in taskdepweights:
         #print("[calc_comm_time]",prednode, prednodename, node, nodename, nodename in taskdepweights)
@@ -545,12 +581,17 @@ def _calc_comm_time(node, nodeattrs, proc, prednode, prednodeattrs, predproc, ta
             ra_dst = dep[5]
             datasize = float(dep[6])
             if dep[1] == prednodename:
+                total_datasize += datasize
                 ra_src_mem = mapping['mapping'][pdtaskname]['regions'][str(ra_src)]
                 ra_dst_mem = mapping['mapping'][nodetaskname]['regions'][str(ra_dst)]
                 #print(pdtaskname,ra_src,ra_src_mem, nodetaskname, ra_dst, ra_dst_mem, datasize, type(datasize))
                 #commcost += datasize*(1/10)
                 #commcost += _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel)
-                commcost += _transfer_time(predproc, ra_src_mem, proc, ra_dst_mem, datasize, machine)
+                curcommcost = _transfer_time(predproc, ra_src_mem, proc, ra_dst_mem, datasize, machine)
+                commcost += curcommcost
+                logger.info(f"[_calc_comm_time]\t{prednodename} {pdtaskname} {predproc.id} {predproc.kind.value} {_mem_name_fix(ra_src_mem)} <-> "
+                            f"{_mem_name_fix(ra_dst_mem)} {proc.kind.value} {proc.id} {nodetaskname} {nodename}")
+                logger.info(f"\t\t{datasize} bytes {curcommcost} {commcost}")
 #                mincostcommra = sys.maxsize
 #                bestmem = None
 #                for mem in machinemodel[proc].memories:
@@ -566,6 +607,10 @@ def _calc_comm_time(node, nodeattrs, proc, prednode, prednodeattrs, predproc, ta
 #        ##
         #logger.debug(f"Comm cost {commcost} ns")
 #    ##
+    if commcost > 0.0:
+        logger.info(f"[_calc_comm_time] All deps {prednodename} {predproc.id} {predproc.kind.value} <-> "
+                    f"{proc.kind.value} {proc.id} {nodename} {total_datasize} bytes {commcost}\n")
+
     return commcost
 
 def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodetaskname):
@@ -593,6 +638,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodet
         else:
             commtime = _calc_comm_time(node, dag.nodes[node], proc, prednode, dag.nodes[prednode], predjob.proc, taskdepweights, mapping, machine)
             #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
+            _self.totalcomm += commtime
             ready_time_t = predjob.end + commtime
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
         if ready_time_t > ready_time:
@@ -634,6 +680,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodet
 def tasksTimeCalc(linmodel, mapping):
     """Calculate computation cost for all tasks in a given according to linear model.
     """
+    #origlevel = updateLoggerLevel(logging.DEBUG)
 
     taskstime = {}
     for taskname, tmap in mapping['mapping'].items():
@@ -681,10 +728,12 @@ def tasksTimeCalc(linmodel, mapping):
                 logger.debug("[taskstime] No timings for {} {} {} {}".format(taskname,regstr, pkstr, mkstr))
             #
         ##
+        logger.debug(f"Final task {taskname} = {totaltime}")
 
         taskstime[taskname] = totaltime
     ##
     #print(perfdata) 
+    #logger.setLevel(origlevel)
     return taskstime
 ###
 
@@ -974,12 +1023,20 @@ def generate_argparser():
     parser.add_argument("--showGantt", 
                         help="Switch used to enable display of the final scheduled Gantt chart", 
                         dest="showGantt", action="store_true")
+    parser.add_argument("--saveGantt", 
+                        help="Switch used to save the scheduled Gantt chart for each mapping", 
+                        action="store_true")
+    parser.add_argument("--pproc",
+                        help="Show times per processor.",
+                        action="store_true")
+
     return parser
 
 if __name__ == "__main__":
     argparser = generate_argparser()
     args = argparser.parse_args()
 
+    start = time.time()
     logger.setLevel(logging.getLevelName(args.loglevel))
     consolehandler = logging.StreamHandler()
     consolehandler.setLevel(logging.getLevelName(args.loglevel))
@@ -1000,7 +1057,7 @@ if __name__ == "__main__":
     # For now, the dag do not weight per region argument between task instances.
     #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
 
-    besttime, best_mfile, processor_schedules= schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
+    besttime, best_mfile, processor_schedules = schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
                                             mappings=args.mapping_files, taskdepweights=taskdepcomm, machine=machine, 
                                             task_inst_names=tasknames)
 
@@ -1015,6 +1072,10 @@ if __name__ == "__main__":
             totaltime = lastjobendtime
 
     logger.info(f"Best mapping {best_mfile} final result time {totaltime:.3f} ns or {totaltime*1.0e-6:.3f} ms.")
+    num_mappings = len(args.mapping_files)
+    end = time.time()
+    delta = end - start
+    logger.info(f"Simulator processed {num_mappings} mappings in {delta:.2f} sec (avg: {delta/num_mappings:.2f} sec/mapping).")
 
     if args.showGantt:
         showGanttChart(processor_schedules)
