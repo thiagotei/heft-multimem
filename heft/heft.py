@@ -114,7 +114,7 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
     }
     _self = SimpleNamespace(**_self)
 
-    nx.nx_pydot.write_dot(dag, './dag_debug.dot')
+    #nx.nx_pydot.write_dot(dag, './dag_debug.dot')
 
     # Nodes with no successors cause the any expression to be empty    
     root_node = [node for node in dag.nodes() if not any(True for _ in dag.predecessors(node))]
@@ -130,6 +130,9 @@ def schedule_dag(dag, linmodel, proc_schedules_inp=None,
         #receive mapping
         mapping = readMapping(m_file)
         taskstime = tasksTimeCalc(linmodel, mapping)
+        # #TODO remove this! it is just for testing
+        #taskstime['realm_copy'] = 10000
+        #taskstime['realm_fill'] = 10000
         m_iter = mapping['iteration']
 
         logger.info(f"====================== Mapping {m_iter} {m_file} {m_i}/{num_mappings} ======================"); 
@@ -589,9 +592,9 @@ def _calc_comm_time(node, nodeattrs, proc, prednode, prednodeattrs, predproc, ta
                 #commcost += _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel)
                 curcommcost = _transfer_time(predproc, ra_src_mem, proc, ra_dst_mem, datasize, machine)
                 commcost += curcommcost
-                logger.info(f"[_calc_comm_time]\t{prednodename} {pdtaskname} {predproc.id} {predproc.kind.value} {_mem_name_fix(ra_src_mem)} <-> "
-                            f"{_mem_name_fix(ra_dst_mem)} {proc.kind.value} {proc.id} {nodetaskname} {nodename}")
-                logger.info(f"\t\t{datasize} bytes {curcommcost} {commcost}")
+                #logger.info(f"[_calc_comm_time]\t{prednodename} {pdtaskname} {predproc.id} {predproc.kind.value} {_mem_name_fix(ra_src_mem)} <-> "
+                #            f"{_mem_name_fix(ra_dst_mem)} {proc.kind.value} {proc.id} {nodetaskname} {nodename}")
+                #logger.info(f"\t\t{datasize} bytes {curcommcost} {commcost}")
 #                mincostcommra = sys.maxsize
 #                bestmem = None
 #                for mem in machinemodel[proc].memories:
@@ -607,7 +610,7 @@ def _calc_comm_time(node, nodeattrs, proc, prednode, prednodeattrs, predproc, ta
 #        ##
         #logger.debug(f"Comm cost {commcost} ns")
 #    ##
-    if commcost > 0.0:
+    if commcost > 0.0 and logger.isEnabledFor(logging.DEBUG):
         logger.info(f"[_calc_comm_time] All deps {prednodename} {predproc.id} {predproc.kind.value} <-> "
                     f"{proc.kind.value} {proc.id} {nodename} {total_datasize} bytes {commcost}\n")
 
