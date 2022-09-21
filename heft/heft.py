@@ -701,162 +701,128 @@ def tasksTimeCalc(linmodel, mapping):
     return taskstime
 ###
 
-def readCsvToNumpyMatrix(csv_file):
-    """
-    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
-    this function reads that data into a numpy matrix and strips the top row and leftmost column
-    """
-    with open(csv_file) as fd:
-        logger.debug(f"Reading the contents of {csv_file} into a matrix")
-        contents = fd.read()
-        contentsList = contents.split('\n')
-        contentsList = list(map(lambda line: line.split(','), contentsList))
-        contentsList = list(filter(lambda arr: arr != [''], contentsList))
-        
-        matrix = np.array(contentsList)
-        # Matrix has id for each node, but we need the actula node names.
-        nodenames = list(matrix[0, 1:])
-        matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
-        matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
-        matrix = matrix.astype(float)
-        logger.debug(f"Nodenames:\n{nodenames}")
-        logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
-        return matrix, nodenames
-
-def readDagMatrix(dag_file, itlfile, show_dag=False):
-    """
-    Given an input file consisting of a connectivity matrix, reads and parses it into a networkx Directional Graph (DiGraph)
-    """
-    matrix, nodesnames = readCsvToNumpyMatrix(dag_file)
-
-    dag = nx.DiGraph(matrix)
-    dag.remove_edges_from(
-        # Remove all edges with weight of 0 since we have no placeholder for "this edge doesn't exist" in the input file
-        [edge for edge in dag.edges() if dag.get_edge_data(*edge)['weight'] == '0.0']
-    )
-
-    with open(itlfile, 'r') as fd:
-        csvfile = csv.reader(fd)
-        itld = {}
-        itlowner = {}
-
-        for line in csvfile:
-            ind = line[0]
-            info = line[1:]
-            itld[ind] = info
-            # Count how many points in the index domain by adding tasks with same owner.
-            # Used to know which node place the task.
-            owner = info[1]
-            if owner in itlowner:
-                itlowner[owner] += 1
-            else:
-                itlowner[owner] = 1
-        ##
-
-        attrs = {}
-        for n in dag.nodes:
-            if n in itld:
-                itl = True
-                pnt = itld[2]
-                owner = itld[1]
-                tltpnt = itlowner[owner]
-            else:
-                itl = False
-                pnt = -1
-                tltpnt = -1
-            #
-
-            attrs[n] = {"taskinstname" : nodesnames[n],
-                        "itl" : itl,
-                        "itlpnt" : pnt,
-                        "itltotal" : tltpnt}
-
-    nx.set_node_attributes(dag, attrs)
-    #print("Blah:\n",dag.nodes[0]["taskinstname"])
-    #print("Blah:\n", attrs)
-
-    #print(list(dag.nodes))
-    if show_dag:
-        nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
-        plt.show()
-
-    return dag
-
-def readMultiDagMatrix(dag_file, show_dag=False):
-    """
-    Given an input file consisting of a connectivity matrix, reads and parses it into a networkx Directional Graph (DiGraph)
-    """
-    #matrix = readCsvToNumpyMatrix(dag_file)
-    with open(dag_file) as fd:
-        logger.debug(f"Reading the contents of {dag_file} into a matrix")
-        contents = fd.read()
-        contentsList = contents.split('\n')
-        contentsList = list(map(lambda line: line.split(','), contentsList))
-        contentsList = list(filter(lambda arr: arr != [''], contentsList))
-        logger.debug(f"Content list:\n{contentsList}")
-
-        newDag = nx.MultiDiGraph()
-
-        #Ignore first line and first column
-        for line, lval in enumerate(contentsList[1:]):
-            for col, cval in enumerate(lval[1:]):
-                wvals = cval.split('-')
-                for widx, w in enumerate(wvals):
-                    wv = float(w)
-                    if wv != 0.0:
-                        newDag.add_edge(line, col, key=widx, rsize=wv)
-                ##
-            ##
-        ##
-        logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{newDag}")
-
-        
-        #matrix = np.array(contentsList)
-        #matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
-        #matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
-        #matrix = matrix.astype(float)
-        #logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
-
-        #dag = nx.MultiDiGraph(matrix)
-        #dag.remove_edges_from(
-            # Remove all edges with weight of 0 since we have no placeholder for "this edge doesn't exist" in the input file
-        #    [edge for edge in dag.edges() if dag.get_edge_data(*edge)['weight'] == '0.0']
-        #)
-
-        if show_dag:
-            nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
-            plt.show()
-
-    return newDag
+def _cleanRealmNeighbors(dag, neigh, funcneigh, nodeprefix='realm'):
+    '''Transively remove all neighbours that are realm nodes.
+       Their neighbors are added instead.
+    '''
+    # Find if there are realm_nodes as predecessors or successors of other realm_nodes
+    realm_neighs = [p for p in neigh if p.startswith(nodeprefix)]
+    while realm_neighs:
+        tmp = []
+        # Remove the realm nodes after their preds have been added.
+        for p in realm_neighs:
+            tmp = tmp + list(funcneigh(p))
+            neigh.remove(p)
+        #
+        realm_neighs = [p for p in tmp if p.startswith(nodeprefix)]
+        neigh += tmp
+    ##
+###
 
 def readDagDot(dot_file, save_dag=False):
 
     dag = nx.drawing.nx_pydot.read_dot(dot_file)
+    del_realm = True
 
-    # TODO Cleanup the realm nodes, and put their connect their nodes that they connect
     logger.info(f"Loading dot file {dot_file}...")
-    print(dag)
     logger.info(f"{dag}")
+
+    realmnodes = {}
     nodesacct = {}
     for n, attrs in dag.nodes(data=True):
         if n.startswith('realm'):
             tname = n.rsplit('_', 1)[0]
-            print(f"{n} In: {dag.in_degree(n)} {list(dag.predecessors(n))}  Out: {dag.out_degree(n)} {list(dag.successors(n))}")
+            if del_realm or logger.isEnabledFor(logging.DEBUG):
+                preds = list(dag.predecessors(n))
+                succs = list(dag.successors(n))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"{n} In: {dag.in_degree(n)} {preds}  Out: {dag.out_degree(n)} {succs}")
+
+                if del_realm:
+                    _cleanRealmNeighbors(dag, preds, dag.predecessors)
+                    _cleanRealmNeighbors(dag, succs, dag.successors)
+
+                    realmnodes[n] = (preds, succs)
+                #
+            #
         else:
             tname = attrs['lgtaskname'].strip('"')
-            print(f"{n} {tname} In: {dag.in_degree(n)} Out: {dag.out_degree(n)} Attrs: {attrs}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"{n} {tname} In: {dag.in_degree(n)} Out: {dag.out_degree(n)} Attrs: {attrs}")
+            #
         #
         if tname not in nodesacct:
             nodesacct[tname] = 0
         #
         nodesacct[tname] += 1
     ##
-    print(nodesacct)
+
+    logger.info(nodesacct)
+
+    # Remove realm nodes, 
+    if del_realm:
+        dag.remove_nodes_from(realmnodes.keys())
+        logger.info(f"{dag}")
+
+        # Replace edges that were removed
+        for _, (preds, succs) in realmnodes.items():
+            for p in preds:
+                for s in succs:
+                    dag.add_edge(p, s)
+                #
+            #
+        #
+        logger.info(f"{dag}")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            nodesacct = {}
+            for n, attrs in dag.nodes(data=True):
+                if n.startswith('realm'):
+                    tname = n.rsplit('_', 1)[0]
+                else:
+                    tname = attrs['lgtaskname'].strip('"')
+                #
+                if tname not in nodesacct:
+                    nodesacct[tname] = 0
+                #
+                nodesacct[tname] += 1
+            ##
+            logger.info(nodesacct)
+        #
+    #
+
+    # Add single initial and final node
+    init_nodes  = [n for n, deg in dag.in_degree() if deg == 0]
+    final_nodes = [n for n, deg in dag.out_degree() if deg == 0]
+
+    if len(init_nodes) > 1:
+        inode = "_init_"
+        if inode not in dag:
+            for k in init_nodes:
+                dag.add_edge(inode, k)
+        else:
+            raise RuntimeError(f"{inode} node name collision. find a new one!")
+        #
+    #
+
+    if len(final_nodes) > 1:
+        fnode = "_final_"
+        if fnode not in dag:
+            for k in final_nodes:
+                dag.add_edge(k, fnode)
+        else:
+            raise RuntimeError(f"{fnode} node name collision. find a new one!")
+        #
+    #
+
+    logger.info(f"{dag}")
 
     if save_dag:
-        nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
-        dag_filename = os.path.basename(m_file).split('.')[0] # remove path and extension
-        plt.savefig(dag_filename+'.png')
+        #pos = nx.spring_layout(dag)
+        pos = nx.nx_pydot.graphviz_layout(dag, prog='dot')
+        nx.draw(dag, pos=pos, with_labels=False)
+        dag_filename = os.path.basename(dot_file).split('.')[0] # remove path and extension
+        plt.savefig(dag_filename+'.pdf')
     #   #
 
     return dag
@@ -1031,6 +997,10 @@ def generate_argparser():
     parser.add_argument("--pproc",
                         help="Show times per processor.",
                         action="store_true")
+    parser.add_argument("--parseDAGonly",
+                        help="For debugging, run up to dag parsing and stops.",
+                        action="store_true")
+
 
     return parser
 
@@ -1055,11 +1025,12 @@ if __name__ == "__main__":
 
     linmodel = readLinearModel(args.linmodel)
 
-    #dag = readDagMatrix(args.dag_file, args.indexl, args.showDAG)
-    dag = readDagDot(args.dag_file, save_dag=False)
-    sys.exit(0)
-    # For now, the dag do not weight per region argument between task instances.
-    #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
+    dag = readDagDot(args.dag_file, save_dag=args.saveDAG)
+
+    if args.parseDAGonly:
+        logger.warning("Stopping after parsing the task graph!!!")
+        return
+    #
 
     besttime, best_mfile, processor_schedules = schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
                                             mappings=args.mapping_files, taskdepweights=taskdepcomm, machine=machine, 
