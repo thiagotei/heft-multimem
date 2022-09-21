@@ -6,15 +6,9 @@ from heft.gantt import showGanttChart, saveGanttChart
 from types import SimpleNamespace
 from enum import Enum
 
-import argparse
-import logging
-import json, os
-import sys, csv
-import numpy as np
-import matplotlib.pyplot as plt
-import networkx as nx
-import pandas as pd
-import time
+import argparse, logging, json, os, sys, csv
+import numpy as np, matplotlib.pyplot as plt
+import networkx as nx, pydot, pandas as pd, time
 
 logger = logging.getLogger('heft')
 
@@ -250,104 +244,68 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
         if _self.task_schedules[node] is not None:
             continue
         minTaskSchedule = ScheduleEvent(node, inf, inf, Proc(-1, None, None, None))
-        minEDP = inf
-        if op_mode == OpMode.EDP_ABS:
-            assert "power_dict" in kwargs, "In order to perform EDP-based processor assignment, a power_dict is required"
-            taskschedules = []
-            minScheduleStart = inf
+
+        # If index task launch a subset of procs will be selected
+        selprocs = machine.procs
+
+        instname = dag.nodes[node]['taskinstname']
+        # TODO remove this
+        taskname = 'N/A'
+        for t, insts in task_inst_names.items():
+            if instname in insts:
+                taskname = t
+                break
+            #
+        ##
+
+        # This tasks must be selected for automap and index_task_launch
+        if taskname in mapping['mapping'] and \
+            mapping['mapping'][taskname]['index_task_launch']:
+            pnt = dag.nodes[node]['itlpnt']
+            total = dag.nodes[node]['itltotal']
+
+            # if index task launch is not all nodes, then all task instances of that 
+            # index task launch in node 0 for now.
+            selmachnode = 0
+
+            #if index task launch, select which nodes this task can run
+            if mapping['mapping'][taskname]['all_nodes']:
+                # if index task launch all nodes, split homegeneously among all nodes.
+                tpernode = math.ceil(total / len(machine.nodes))
+                selmachnode = int(pnt / tpernode)
+            #
+
+            selprocs = []
 
             for proc in machine.procs:
-                taskschedule = _compute_eft(_self, dag, node, proc)
-                edp_t = ((taskschedule.end - taskschedule.start)**2) * kwargs["power_dict"][node][proc]
-                if (edp_t < minEDP):
-                    minEDP = edp_t
-                    minTaskSchedule = taskschedule
-                elif (edp_t == minEDP and taskschedule.end < minTaskSchedule.end):
-                    minTaskSchedule = taskschedule
-
-        elif op_mode == OpMode.EDP_REL:
-            assert "power_dict" in kwargs, "In order to perform EDP-based processor assignment, a power_dict is required"
-            taskschedules = []
-            minScheduleStart = inf
-
-            for proc in machine.procs:
-                taskschedules.append(_compute_eft(_self, dag, node, proc))
-                if taskschedules[proc].start < minScheduleStart:
-                    minScheduleStart = taskschedules[proc].start
-
-            for taskschedule in taskschedules:
-                # Use the makespan relative to the earliest potential assignment to encourage load balancing
-                edp_t = ((taskschedule.end - minScheduleStart)**2) * kwargs["power_dict"][node][taskschedule.proc]
-                if (edp_t < minEDP):
-                    minEDP = edp_t
-                    minTaskSchedule = taskschedule
-                elif (edp_t == minEDP and taskschedule.end < minTaskSchedule.end):
-                    minTaskSchedule = taskschedule
-
-        elif op_mode == OpMode.ENERGY:
-            assert False, "Feature not implemented"
-            assert "power_dict" in kwargs, "In order to perform Energy-based processor assignment, a power_dict is required"
-
-        else:
-            # If index task launch a subset of procs will be selected
-            selprocs = machine.procs
-
-            instname = dag.nodes[node]['taskinstname']
-            taskname = 'N/A'
-            for t, insts in task_inst_names.items():
-                if instname in insts:
-                    taskname = t
-                    break
+                if proc.node == selmachnode:
+                    selprocs.append(proc)
                 #
             ##
+            #logger.info(f"Redefining procs... {node} {taskname} {instname}\n\t{selprocs}")
+        #
 
-            # This tasks must be selected for automap and index_task_launch
-            if taskname in mapping['mapping'] and \
-                mapping['mapping'][taskname]['index_task_launch']:
-                pnt = dag.nodes[node]['itlpnt']
-                total = dag.nodes[node]['itltotal']
+        if taskname in nodeacct:
+            nodeacct[taskname] += 1
+        else:
+            nodeacct[taskname] = 1
+        #
 
-                # if index task launch is not all nodes, then all task instances of that 
-                # index task launch in node 0 for now.
-                selmachnode = 0
+        for proc in selprocs:
+        #for proc in procs:
+            #logger.info(f"Scheduling {node} {taskname} {instname} {proc}")
+            #logger.info(f"[schedule_dag] comp matrix[{dag.nodes[node]['taskinstname']}, {proc.kind.value}] : {_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value]} {pd.isna(_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value])}")
+            #if mapping['mapping'][dag.nodes[node]['taskinstname']]['processor-kind'] != proc.kind.value:
+            # If processor has NaN value in the computation matrix this task should not use it
+            #if pd.isna(_self.computation_matrix.loc[instname, proc.kind.value]):
+            if taskname in mapping['mapping'] and mapping['mapping'][taskname]['processor-kind'] != proc.kind.value:
+                continue
 
-                #if index task launch, select which nodes this task can run
-                if mapping['mapping'][taskname]['all_nodes']:
-                    # if index task launch all nodes, split homegeneously among all nodes.
-                    tpernode = math.ceil(total / len(machine.nodes))
-                    selmachnode = int(pnt / tpernode)
-                #
-
-                selprocs = []
-
-                for proc in machine.procs:
-                    if proc.node == selmachnode:
-                        selprocs.append(proc)
-                    #
-                ##
-                #logger.info(f"Redefining procs... {node} {taskname} {instname}\n\t{selprocs}")
-            #
-
-            if taskname in nodeacct:
-                nodeacct[taskname] += 1
-            else:
-                nodeacct[taskname] = 1
-            #
-
-            for proc in selprocs:
-            #for proc in procs:
-                #logger.info(f"Scheduling {node} {taskname} {instname} {proc}")
-                #logger.info(f"[schedule_dag] comp matrix[{dag.nodes[node]['taskinstname']}, {proc.kind.value}] : {_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value]} {pd.isna(_self.computation_matrix.loc[dag.nodes[node]['taskinstname'], proc.kind.value])}")
-                #if mapping['mapping'][dag.nodes[node]['taskinstname']]['processor-kind'] != proc.kind.value:
-                # If processor has NaN value in the computation matrix this task should not use it
-                #if pd.isna(_self.computation_matrix.loc[instname, proc.kind.value]):
-                if taskname in mapping['mapping'] and mapping['mapping'][taskname]['processor-kind'] != proc.kind.value:
-                    continue
-
-                taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, taskname)
-                #logger.info(f"Scheduling {node} {taskname} {instname} {proc} {taskschedule.end}")
-                if (taskschedule.end < minTaskSchedule.end):
-                    minTaskSchedule = taskschedule
+            taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, taskname)
+            #logger.info(f"Scheduling {node} {taskname} {instname} {proc} {taskschedule.end}")
+            if (taskschedule.end < minTaskSchedule.end):
+                minTaskSchedule = taskschedule
+        ##
 
         _self.task_schedules[node] = minTaskSchedule
         #_self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
@@ -366,7 +324,8 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
                 second_job = _self.proc_schedules[proc][job+1]
                 assert first_job.end <= second_job.start, \
                 f"Jobs on a particular processor must finish before the next can begin, but job {first_job.task} on processor {first_job.proc} ends at {first_job.end} and its successor {second_job.task} starts at {second_job.start}"
-    
+    ##
+
     dict_output = {}
     for proc_num, proc_tasks in _self.proc_schedules.items():
         for idx, task in enumerate(proc_tasks):
@@ -392,6 +351,8 @@ def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, met
     """
     Uses a basic BFS approach to traverse upwards through the graph assigning ranku along the way
     """
+    #TODO reimplement this by using out_degree calculation.
+    #TODO move this to outside of the loop. No need to this every mapping
     terminal_node = [node for node in dag.nodes() if not any(True for _ in dag.successors(node))]
     assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
     logger.debug(f'terminal node {terminal_node[0]} {dag.nodes[terminal_node[0]]}')
@@ -843,7 +804,7 @@ def readMultiDagMatrix(dag_file, show_dag=False):
                 for widx, w in enumerate(wvals):
                     wv = float(w)
                     if wv != 0.0:
-                        NEwDag.add_edge(line, col, key=widx, rsize=wv)
+                        newDag.add_edge(line, col, key=widx, rsize=wv)
                 ##
             ##
         ##
@@ -868,18 +829,53 @@ def readMultiDagMatrix(dag_file, show_dag=False):
 
     return newDag
 
+def readDagDot(dot_file, save_dag=False):
+
+    dag = nx.drawing.nx_pydot.read_dot(dot_file)
+
+    # TODO Cleanup the realm nodes, and put their connect their nodes that they connect
+    logger.info(f"Loading dot file {dot_file}...")
+    print(dag)
+    logger.info(f"{dag}")
+    nodesacct = {}
+    for n, attrs in dag.nodes(data=True):
+        if n.startswith('realm'):
+            tname = n.rsplit('_', 1)[0]
+            print(f"{n} In: {dag.in_degree(n)} {list(dag.predecessors(n))}  Out: {dag.out_degree(n)} {list(dag.successors(n))}")
+        else:
+            tname = attrs['lgtaskname'].strip('"')
+            print(f"{n} {tname} In: {dag.in_degree(n)} Out: {dag.out_degree(n)} Attrs: {attrs}")
+        #
+        if tname not in nodesacct:
+            nodesacct[tname] = 0
+        #
+        nodesacct[tname] += 1
+    ##
+    print(nodesacct)
+
+    if save_dag:
+        nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
+        dag_filename = os.path.basename(m_file).split('.')[0] # remove path and extension
+        plt.savefig(dag_filename+'.png')
+    #   #
+
+    return dag
+###
+
 def readMapping(mapping_file):
 
     with open(mapping_file, 'r') as m_open_file:
         mapping = json.load(m_open_file)
 
     return mapping
+###
 
 def readMachineModel(mm_file):
     with open(mm_file, 'r') as mm_fd:
         machmodel = json.load(mm_fd)
 
     return machmodel
+###
 
 def readTaskDepWeigths(taskdep_file):
     """
@@ -1023,6 +1019,9 @@ def generate_argparser():
     parser.add_argument("--showDAG", 
                         help="Switch used to enable display of the incoming task DAG", 
                         dest="showDAG", action="store_true")
+    parser.add_argument("--saveDAG", 
+                        help="Save the incoming task DAG", 
+                        dest="saveDAG", action="store_true")
     parser.add_argument("--showGantt", 
                         help="Switch used to enable display of the final scheduled Gantt chart", 
                         dest="showGantt", action="store_true")
@@ -1056,7 +1055,9 @@ if __name__ == "__main__":
 
     linmodel = readLinearModel(args.linmodel)
 
-    dag = readDagMatrix(args.dag_file, args.indexl, args.showDAG)
+    #dag = readDagMatrix(args.dag_file, args.indexl, args.showDAG)
+    dag = readDagDot(args.dag_file, save_dag=False)
+    sys.exit(0)
     # For now, the dag do not weight per region argument between task instances.
     #dag = readMultiDagMatrix(args.dag_file, args.showDAG)
 
