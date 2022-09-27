@@ -16,7 +16,18 @@ class MemKind(Enum):
     FB = 'GPU_FB_MEM' 
     ZC = 'Z_COPY_MEM'
     SY = 'SYSTEM_MEM'
-#
+
+    @staticmethod
+    def key(val):
+        if val == 'GPU_FB_MEM':
+            return MemKind.FB
+        elif val == 'Z_COPY_MEM':
+            return MemKind.ZC
+        elif val == 'SYSTEM_MEM':
+            return MemKind.SY
+        else:
+            raise RuntimeError("[MemKind] {} value not valid!".format(val))
+#   #   #
 
 class ProcKind(Enum):
     LOC = 'LOC_PROC'
@@ -32,10 +43,8 @@ class ProcKind(Enum):
         elif val == 'OMP_PROC':
             return ProcKind.OMP
         else:
-            raise RuntimeError("[Processor] {} value not valid!".format(val))
-        #
-    #
-#
+            raise RuntimeError("[ProcKind] {} value not valid!".format(val))
+#   #   #
 
 Proc = namedtuple('Proc', 'id kind node socket')
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
@@ -133,7 +142,7 @@ def schedule_dag(dag, linmodel, time_offset=0, rank_metric=RankMetric.MEAN,
         logger.debug("====================== Performing Rank-U Computation ======================"); 
         logger.debug("")
         start = time.time()
-        _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, metric=rank_metric, **kwargs)
+        _compute_ranku_mapping(dag, machine, mapping, taskstime, metric=rank_metric, **kwargs)
         delta = time.time() - start
         logger.info(f"*** Ranku computation finished ({delta:.3f} sec)! ***")
 
@@ -182,7 +191,7 @@ def schedule_dag(dag, linmodel, time_offset=0, rank_metric=RankMetric.MEAN,
                 _self_mapping.task_schedules[schedule_event.task] = schedule_event
 
         processor_schedules, _, _ = _schedule_dag_mapping(_self_mapping, dag, machine, sorted_nodes, mapping,
-                                                        op_mode, rank_metric, taskdepweights)
+                                                        op_mode, rank_metric)
 
         finaltime = 0.0
         for proc, jobs in processor_schedules.items():
@@ -216,7 +225,7 @@ def schedule_dag(dag, linmodel, time_offset=0, rank_metric=RankMetric.MEAN,
     return bestmapping
 ###
 
-def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, rank_metric=RankMetric.MEAN, taskdepweights=None):
+def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, rank_metric=RankMetric.MEAN):
     #logger.info(f"\ntask_schedules:\n{_self.task_schedules}")
     #logger.info(f"\nsorted_nodes:\n{sorted_nodes}")
     nodeacct = {}
@@ -275,7 +284,7 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
             if taskname in mapping['mapping'] and mapping['mapping'][taskname]['processor-kind'] != proc.kind.value:
                 continue
 
-            taskschedule = _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, taskname)
+            taskschedule = _compute_eft(_self, dag, node, proc, mapping, machine, taskname)
             #logger.info(f"Scheduling {node} {taskname} {instname} {proc} {taskschedule.end}")
             if (taskschedule.end < minTaskSchedule.end):
                 minTaskSchedule = taskschedule
@@ -320,7 +329,7 @@ def _scale_by_operating_freq(_self, **kwargs):
     #for pe_num, freq in enumerate(kwargs["operating_freqs"]):
         #_self.computation_matrix[:, pe_num] = _self.computation_matrix[:, pe_num] * (1 + compute_DVFS_performance_slowdown(pe_num, freq))
 
-def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, metric=RankMetric.MEAN, **kwargs):
+def _compute_ranku_mapping(dag, machine, mapping, taskstime, metric=RankMetric.MEAN, **kwargs):
 
     """
     Uses a basic BFS approach to traverse upwards through the graph assigning ranku along the way
@@ -351,38 +360,45 @@ def _compute_ranku_mapping(dag, machine, mapping, taskstime, taskdepweights, met
 
         if metric == RankMetric.MEAN:
             max_successor_ranku = -1
-            nodetaskname = 'N/A'
-            for succnode in dag.successors(node):
+            nodetaskname = dag.nodes[node]['lgtaskname'] #dep[0]
+            succs = dag.successors(node)
+
+            for succnode in succs:
                 logger.debug(f"\tLooking at successor node: {succnode}")
 
                 weight = 1
-                if succnode in taskdepweights:
-                    for dep in taskdepweights[succnode]:
-                        if dep[1] == node:
-                            pdtaskname = dep[0]
-                            nodetaskname = dep[3]
-                            ra_src = dep[2]
-                            ra_dst = dep[5]
-                            datasize = float(dep[6])
-                            ra_src_mem = mapping['mapping'][pdtaskname]['regions'][str(ra_src)]
-                            ra_dst_mem = mapping['mapping'][nodetaskname]['regions'][str(ra_dst)]
-                            src_mem = _mem_name_fix(ra_src_mem)
-                            dst_mem = _mem_name_fix(ra_dst_mem)
-                            mempath = src_mem + '_to_' + dst_mem
- 
-                            avg = machine.paths[mempath]['avg']
-                            weight += avg['latency'] + (datasize / avg['bandwidth'])
+                succtaskname = dag.nodes[succnode]['lgtaskname'] #dep[3]
+
+                if nodetaskname in mapping['mapping'] and \
+                   succtaskname in mapping['mapping']:
+                    # For each successor, check all the edges.
+                    for dep in dag.get_edge_data(node, succnode).values(): #taskdepweights[succnode]:
+                        if 'lgrasrc' not in dep or \
+                           'lgradst' not in dep or \
+                           'weight'  not in dep:
+                            continue
                         #
-                    ##
-                #
+                        ra_src = dep['lgrasrc'] #dep[2]
+                        ra_dst = dep['lgradst'] #dep[5]
+                        datasize = float(dep['weight']) #float(dep[6])
+                        ra_src_mem = mapping['mapping'][nodetaskname]['regions'][str(ra_src)]
+                        ra_dst_mem = mapping['mapping'][succtaskname]['regions'][str(ra_dst)]
+                        src_mem = _mem_name_fix(MemKind.key(ra_src_mem))
+                        dst_mem = _mem_name_fix(MemKind.key(ra_dst_mem))
+                        mempath = src_mem + '_to_' + dst_mem
+
+                        avg = machine.paths[mempath]['avg']
+                        weight += avg['latency'] + (datasize / avg['bandwidth'])
+                #   ##
+
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"\tThe edge weight from node {node} to node {succnode} is {weight}, and the ranku for node {succnode} is {dag.nodes()[succnode]['ranku']}")
+                #
 
                 val = float(weight) + dag.nodes()[succnode]['ranku']
                 if val > max_successor_ranku:
                     max_successor_ranku = val
-                #
-            ##
+            ##  #
 
             if max_successor_ranku < 0:
                 raise RuntimeError(f"Expected maximum successor ranku to be greater or equal to 0 but was {max_successor_ranku}")
@@ -426,13 +442,12 @@ def _mem_name_fix(memname):
     """ Mapping memory names from mapping to machine model.
     """
 
-    #print(memname)
     name = 'N/A'
-    if memname == MemKind.ZC.value:
+    if memname == MemKind.ZC:
         name = 'sys_mem'
-    elif memname == MemKind.FB.value:
+    elif memname == MemKind.FB:
         name = 'gpu_fb_mem'
-    elif memname == MemKind.SY.value:
+    elif memname == MemKind.SY:
         name = 'sys_mem'
     else:
         raise RuntimeError(f"Memory kind {memname} not found.")
@@ -450,6 +465,20 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
 
     # If in the same node
     if ra_src_proc.node == ra_dst_proc.node:
+        if ra_src_mem == MemKind.FB and \
+           ra_dst_mem == MemKind.FB and \
+           ra_src_proc.id == ra_dst_proc.id:
+            return 0.0
+
+        elif ra_src_mem == MemKind.SY and \
+             ra_dst_mem == MemKind.SY:
+            return 0.0
+
+        elif ra_src_mem == MemKind.ZC and \
+             ra_dst_mem == MemKind.ZC:
+            return 0.0
+        #
+
         # If in the same socket
         if ra_src_proc.socket == ra_dst_proc.socket:
             pathname = 'intra_socket'
@@ -495,7 +524,7 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
     logger.debug(transfer_time)
     return transfer_time
 
-def _calc_comm_time(node, proc, prednode, predproc, edges, mapping, machine):
+def _calc_comm_time(node, nodetname, proc, prednode, predtname, predproc, edges, mapping, machine):
     """
     Calculate communication cost based on the predecessor node and node according to mapping
     of overlapping region arguments.
@@ -503,34 +532,35 @@ def _calc_comm_time(node, proc, prednode, predproc, edges, mapping, machine):
     by processor selected.
     """
     #print(mapping)
-    logger.info(f"{node} {edges}")
+    #logger.info(f"{node} {edges}")
     commcost = 0.0
     commdecisions = {}
 
     total_datasize = 0
 
     #if node in taskdepweights:
-    if edge is not None:
+    if edges is not None and \
+       nodetname in mapping['mapping'] and \
+       predtname in mapping['mapping']:
         #print("[calc_comm_time]",prednode, node, node in taskdepweights)
-        for dep in edges:
-            #print("       ",dep )
-            pdtaskname = dep[0]
-            nodetaskname = dep[3]
+        for dep in edges.values():
+            if 'lgrasrc' not in dep or \
+               'lgradst' not in dep or \
+               'weight'  not in dep:
+                continue
+            #
+
             ra_src = dep['lgrasrc'] #dep[2]
             ra_dst = dep['lgradst'] #dep[5]
             datasize = float(dep['weight'])#float(dep[6])
-            if dep[1] == prednode:
-                total_datasize += datasize
-                ra_src_mem = mapping['mapping'][pdtaskname]['regions'][str(ra_src)]
-                ra_dst_mem = mapping['mapping'][nodetaskname]['regions'][str(ra_dst)]
-                #print(pdtaskname,ra_src,ra_src_mem, nodetaskname, ra_dst, ra_dst_mem, datasize, type(datasize))
-                #commcost += datasize*(1/10)
-                #commcost += _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, machinemodel)
-                curcommcost = _transfer_time(predproc, ra_src_mem, proc, ra_dst_mem, datasize, machine)
-                commcost += curcommcost
-                #logger.info(f"[_calc_comm_time]\t{prednode} {pdtaskname} {predproc.id} {predproc.kind.value} {_mem_name_fix(ra_src_mem)} <-> "
-                #            f"{_mem_name_fix(ra_dst_mem)} {proc.kind.value} {proc.id} {nodetaskname} {node}")
-                #logger.info(f"\t\t{datasize} bytes {curcommcost} {commcost}")
+            total_datasize += datasize
+            ra_src_mem = mapping['mapping'][predtname]['regions'][str(ra_src)]
+            ra_dst_mem = mapping['mapping'][nodetname]['regions'][str(ra_dst)]
+            curcommcost = _transfer_time(predproc, MemKind.key(ra_src_mem), proc, MemKind.key(ra_dst_mem), datasize, machine)
+            commcost += curcommcost
+            #logger.info(f"\t{prednode} {predtname} {predproc.id} {predproc.kind.value} {_mem_name_fix(ra_src_mem)} <-> "
+            #            f"{_mem_name_fix(ra_dst_mem)} {proc.kind.value} {proc.id} {nodetname} {node}")
+            #logger.info(f"\t\t{datasize} bytes {curcommcost} {commcost}")
 #                mincostcommra = sys.maxsize
 #                bestmem = None
 #                for mem in machinemodel[proc].memories:
@@ -547,12 +577,12 @@ def _calc_comm_time(node, proc, prednode, predproc, edges, mapping, machine):
         #logger.debug(f"Comm cost {commcost} ns")
 #    ##
     if commcost > 0.0 and logger.isEnabledFor(logging.DEBUG):
-        logger.info(f"[_calc_comm_time] All deps {prednode} {predproc.id} {predproc.kind.value} <-> "
+        logger.debug(f"All deps {prednode} {predproc.id} {predproc.kind.value} <-> "
                     f"{proc.kind.value} {proc.id} {node} {total_datasize} bytes {commcost}\n")
 
     return commcost
 
-def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodetaskname):
+def _compute_eft(_self, dag, node, proc, mapping, machine, nodetaskname):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -568,7 +598,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodet
         if False: # _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
-            commtime = _calc_comm_time(node, proc, prednode, predjob.proc, dag.get_edge_data(prednode, node), mapping, machine)
+            commtime = _calc_comm_time(node, dag.nodes[node]['lgtaskname'], proc, prednode, dag.nodes[prednode]['lgtaskname'], predjob.proc, dag.get_edge_data(prednode, node), mapping, machine)
             #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
             _self.totalcomm += commtime
             ready_time_t = predjob.end + commtime
