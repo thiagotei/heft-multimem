@@ -91,7 +91,7 @@ def updateLoggerLevel(l):
 ###
 
 def schedule_dag(dag, linmodel, time_offset=0, rank_metric=RankMetric.MEAN, 
-                mappings=None, taskdepweights=None, machine=None, 
+                mappings=None, machine=None, 
                 task_cost_def=1, **kwargs):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
@@ -309,7 +309,7 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
             else:
                 dict_output[task.task] = (proc_num, idx, [])
 
-    logger.info(f"Node acct:\n{json.dumps(nodeacct, indent=2, sort_keys=True)}")
+    logger.info(f"Nodes processed:\n{json.dumps(nodeacct, indent=2, sort_keys=True)}")
 
     return _self.proc_schedules, _self.task_schedules, dict_output
 
@@ -702,16 +702,17 @@ def readDagDot(dot_file, save_dag=False):
         if n.startswith('realm'):
             tname = n.rsplit('_', 1)[0]
             if del_realm or logger.isEnabledFor(logging.DEBUG):
-                preds = list(dag.predecessors(n))
-                succs = list(dag.successors(n))
                 if logger.isEnabledFor(logging.DEBUG):
+                    preds = list(dag.predecessors(n))
+                    succs = list(dag.successors(n))
                     logger.debug(f"{n} In: {dag.in_degree(n)} {preds}  Out: {dag.out_degree(n)} {succs}")
 
                 if del_realm:
-                    _cleanRealmNeighbors(dag, preds, dag.predecessors)
-                    _cleanRealmNeighbors(dag, succs, dag.successors)
+                    #_cleanRealmNeighbors(dag, preds, dag.predecessors)
+                    #_cleanRealmNeighbors(dag, succs, dag.successors)
 
-                    realmnodes[n] = (preds, succs)
+                    #realmnodes[n] = (preds, succs)
+                    realmnodes[n] = True
                 #
             #
         else:
@@ -731,6 +732,14 @@ def readDagDot(dot_file, save_dag=False):
             lgpnt = attrs['lgpnt']
             attrs['lgpnt'] = int(lgpnt.strip('\"()')) if lgpnt != '\"None\"' else 0
         #
+
+        # Clean up some unecessary attributes from nodes
+        unnecessary_attrs =['label', 'fontcolor', 'fontsize', 'shape', 'penwidth']
+        for a in unnecessary_attrs:
+            if a in attrs:
+                del attrs[a]
+        ##
+
         if tname not in nodesacct:
             nodesacct[tname] = 0
         #
@@ -739,22 +748,50 @@ def readDagDot(dot_file, save_dag=False):
 
     logger.info(nodesacct)
 
-    # Remove realm nodes, 
+    # After collecting in_edges and out_edges for realm nodes,
+    # connects predecessors to successors of each realm node and then remove it 
+    # until there are no more realm nodes. The weight of the edges must be kept and there
+    # may be multiple edges between each pair of nodes.
     if del_realm:
-        dag.remove_nodes_from(realmnodes.keys())
-        logger.debug(f"{dag}")
+        logger.debug(f"{len(realmnodes.keys())} realmnodes to be removed...")
+        for rn in realmnodes.keys():
+            in_e = dag.in_edges(rn, data=True, keys=True)
+            out_e = dag.out_edges(rn, data=True, keys=True)
 
-        # Replace edges that were removed
-        for _, (preds, succs) in realmnodes.items():
-            for p in preds:
-                for s in succs:
-                    dag.add_edge(p, s)
-                #
-            #
-        #
-        logger.debug(f"{dag}")
+            # For each in edge, connect to all out nodes.
+            for isrc, idst, ikey, iattrs in in_e:
+                for osrc, odst, okey, oattrs in out_e:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Replacing edge {isrc} -> {idst} and {osrc} -> {odst} by {isrc} -> {odst}. {iattrs} {oattrs}")
+                    #
+
+                    weight = 0
+
+                    # RealmFill nodes have no weight for now. So, I just pick one of them be used as weight
+                    # of the new edge.
+                    if 'weight' not in iattrs or 'weight' not in oattrs:
+                        if 'weight' in iattrs:
+                            weight = int(iattrs['weight'])
+                        else:
+                            weight = int(oattrs['weight'])
+                        #
+                    elif 'weight' in iattrs and 'weight' in oattrs and \
+                        iattrs['weight'] != oattrs['weight']:
+                        raise RuntimeError(f"Weights different when replaing edge. They should be equal!")
+                    else:
+                       weight = int(iattrs['weight'])
+                    #
+
+                    dag.add_edge(isrc, odst, weight=weight)
+        ##  ##  ##
+
+        # By removing nodes, the edges will also be deleted.
+        dag.remove_nodes_from(realmnodes)
+
 
         if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"{dag}")
+
             nodesacct = {}
             for n, attrs in dag.nodes(data=True):
                 if n.startswith('realm'):
@@ -768,8 +805,40 @@ def readDagDot(dot_file, save_dag=False):
                 nodesacct[tname] += 1
             ##
             logger.info(nodesacct)
-        #
-    #
+    ##  #
+
+    #TODO erase this
+    # Remove realm nodes, 
+#    if False: #del_realm:
+#        dag.remove_nodes_from(realmnodes.keys())
+#        logger.debug(f"{dag}")
+#
+#        # Replace edges that were removed
+#        for _, (preds, succs) in realmnodes.items():
+#            for p in preds:
+#                for s in succs:
+#                    dag.add_edge(p, s)
+#                #
+#            #
+#        #
+#        logger.debug(f"{dag}")
+#
+#        if logger.isEnabledFor(logging.DEBUG):
+#            nodesacct = {}
+#            for n, attrs in dag.nodes(data=True):
+#                if n.startswith('realm'):
+#                    tname = n.rsplit('_', 1)[0]
+#                else:
+#                    tname = attrs['lgtaskname']
+#                #
+#                if tname not in nodesacct:
+#                    nodesacct[tname] = 0
+#                #
+#                nodesacct[tname] += 1
+#            ##
+#            logger.info(nodesacct)
+#        #
+#    #
 
     # Add the index task launch total points to each node
     for n, attrs in dag.nodes(data=True):
@@ -806,11 +875,16 @@ def readDagDot(dot_file, save_dag=False):
     logger.info(f"{dag}")
 
     if save_dag:
+        dag_filename = os.path.basename(dot_file).split('.')[0] # remove path and extension
+        dag_dot = './'+dag_filename+'_parsed.dot'
+        nx.drawing.nx_pydot.write_dot(dag, dag_dot)
+        logger.info(f"*** Saved dag as {dag_dot} ***")
         #pos = nx.spring_layout(dag)
         pos = nx.nx_pydot.graphviz_layout(dag, prog='dot')
         nx.draw(dag, pos=pos, with_labels=False)
-        dag_filename = os.path.basename(dot_file).split('.')[0] # remove path and extension
-        plt.savefig(dag_filename+'.pdf')
+        dag_pdf = dag_filename+'.pdf'
+        plt.savefig(dag_pdf)
+        logger.info(f"*** Saved dag as {dag_pdf} ***")
     #   #
 
     return dag
@@ -833,52 +907,6 @@ def readMachineModel(mm_file):
 def readLinearModel(linmodel_file):
     return readJson(linmodel_file)
 ###
-
-def readTaskDepWeigths(taskdep_file):
-    """
-    Read a file with a dependence between tasks per region argument in bytes.
-    """
-    with open(taskdep_file, 'r') as fd:
-        contents = fd.read()
-        contentsList = contents.split('\n')
-        contentsList = list(map(lambda line: line.split(','), contentsList))
-        contentsList = list(filter(lambda arr: arr != [''], contentsList))
-
-        # a dict per destination task instance
-        taskdepwgts = {}
-        #print(contentsList)
-
-        for r in contentsList:
-            assert len(r) == 7,f"Expecting 7 fieds on taskdep file, but got {len(r)}"
-            if r[4] not in taskdepwgts:
-                taskdepwgts[r[4]] = []
-            #
-
-            taskdepwgts[r[4]].append(r)
-        #
-
-    return taskdepwgts
-###
-
-def readTaskNames(tasknames_file):
-    with open(tasknames_file, 'r') as fd:
-        contents = fd.read()
-        contentsList = contents.split('\n')
-        contentsList = list(map(lambda line: line.split(','), contentsList))
-        contentsList = list(filter(lambda arr: arr != [''], contentsList))
-
-        nodestasknames = {}
-
-        for line in contentsList:
-            if line[0] not in nodestasknames:
-                nodestasknames[line[0]] = []
-            #
-            for node in line[1:]:
-                nodestasknames[line[0]].append(node)
-            ##
-        ##
-
-    return nodestasknames
 
 def createProcs(machm_file):
     machmodel = readMachineModel(machm_file)
@@ -951,8 +979,6 @@ def generate_argparser():
                         help="File containing the machine model.")
     parser.add_argument("--mappings", type=str, nargs='+', required=True, dest="mapping_files", 
                         help="Files containing mapping decisions.")
-    parser.add_argument("--taskdepra", type=str, required=True, dest="task_dep_weights",
-                        help="File containing the machine model.")
     parser.add_argument("-l", "--loglevel", 
                         help="The log level to be used in this module. Default: INFO", 
                         type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
@@ -998,9 +1024,6 @@ if __name__ == "__main__":
 
     start_inpread = time.time()
 
-    # receive taskdepcomm
-    taskdepcomm = readTaskDepWeigths(args.task_dep_weights)
-
     # processors data structure based on mach model
     machine = createProcs(args.machine_model_file)
 
@@ -1022,7 +1045,7 @@ if __name__ == "__main__":
 
     start_maps = time.time()
     besttime, best_mfile, processor_schedules = schedule_dag(dag, linmodel, rank_metric=args.rank_metric, 
-                                            mappings=args.mapping_files, taskdepweights=taskdepcomm, machine=machine)
+                                            mappings=args.mapping_files, machine=machine)
     delta_maps = time.time() - start_maps
 
     totaltime = 0.0
