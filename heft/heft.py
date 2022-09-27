@@ -102,7 +102,6 @@ def schedule_dag(dag, linmodel, time_offset=0, rank_metric=RankMetric.MEAN,
 
     _self = {
         'machine' : machine,
-        'taskdepweights' : taskdepweights,
         'root_node': None,
     }
     _self = SimpleNamespace(**_self)
@@ -496,7 +495,7 @@ def _transfer_time(ra_src_proc, ra_src_mem, ra_dst_proc, ra_dst_mem, datasize, m
     logger.debug(transfer_time)
     return transfer_time
 
-def _calc_comm_time(node, proc, prednode, predproc, taskdepweights, mapping, machine):
+def _calc_comm_time(node, proc, prednode, predproc, edges, mapping, machine):
     """
     Calculate communication cost based on the predecessor node and node according to mapping
     of overlapping region arguments.
@@ -504,20 +503,22 @@ def _calc_comm_time(node, proc, prednode, predproc, taskdepweights, mapping, mac
     by processor selected.
     """
     #print(mapping)
+    logger.info(f"{node} {edges}")
     commcost = 0.0
     commdecisions = {}
 
     total_datasize = 0
 
-    if node in taskdepweights:
+    #if node in taskdepweights:
+    if edge is not None:
         #print("[calc_comm_time]",prednode, node, node in taskdepweights)
-        for dep in taskdepweights[node]:
+        for dep in edges:
             #print("       ",dep )
             pdtaskname = dep[0]
-            nodetaskname   = dep[3]
-            ra_src = dep[2]
-            ra_dst = dep[5]
-            datasize = float(dep[6])
+            nodetaskname = dep[3]
+            ra_src = dep['lgrasrc'] #dep[2]
+            ra_dst = dep['lgradst'] #dep[5]
+            datasize = float(dep['weight'])#float(dep[6])
             if dep[1] == prednode:
                 total_datasize += datasize
                 ra_src_mem = mapping['mapping'][pdtaskname]['regions'][str(ra_src)]
@@ -567,7 +568,7 @@ def _compute_eft(_self, dag, node, proc, taskdepweights, mapping, machine, nodet
         if False: # _self.communication_matrix[predjob.proc, proc] == 0:
             ready_time_t = predjob.end
         else:
-            commtime = _calc_comm_time(node, proc, prednode, predjob.proc, taskdepweights, mapping, machine)
+            commtime = _calc_comm_time(node, proc, prednode, predjob.proc, dag.get_edge_data(prednode, node), mapping, machine)
             #ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc] + _self.communication_startup[predjob.proc]
             _self.totalcomm += commtime
             ready_time_t = predjob.end + commtime
@@ -694,6 +695,33 @@ def readDagDot(dot_file, save_dag=False):
 
     logger.debug(f"{dag}")
 
+    # Add single initial and final node
+    init_nodes  = [n for n, deg in dag.in_degree() if deg == 0]
+    final_nodes = [n for n, deg in dag.out_degree() if deg == 0]
+
+    if len(init_nodes) > 1:
+        inode = "_init_"
+        if inode not in dag:
+            dag.add_node(inode, lgtaskname=inode,lgidxowner="None")
+            for k in init_nodes:
+                dag.add_edge(inode, k, weight=1)
+        else:
+            raise RuntimeError(f"{inode} node name collision. find a new one!")
+        #
+    #
+
+    if len(final_nodes) > 1:
+        fnode = "_final_"
+        if fnode not in dag:
+            dag.add_node(fnode, lgtaskname=fnode, lgidxowner="None")
+            for k in final_nodes:
+                dag.add_edge(k, fnode, weight=1)
+        else:
+            raise RuntimeError(f"{fnode} node name collision. find a new one!")
+    #   #
+
+    logger.info(f"{dag}")
+
     # Calculate how many index task launch based on tasks instances with same owner.
     itlowner = {}
     realmnodes = {}
@@ -721,7 +749,7 @@ def readDagDot(dot_file, save_dag=False):
                 logger.debug(f"{n} {tname} In: {dag.in_degree(n)} Out: {dag.out_degree(n)} Attrs: {attrs}")
             #
 
-            owner = attrs['lgidxowner']
+            owner = attrs['lgidxowner'] if 'lgidxowner' in attrs else "None"
             if owner in itlowner:
                 itlowner[owner] += 1
             else:
@@ -729,7 +757,7 @@ def readDagDot(dot_file, save_dag=False):
             #
 
             # Fix the point string to number
-            lgpnt = attrs['lgpnt']
+            lgpnt = attrs['lgpnt'] if 'lgpnt' in attrs else '\"None\"'
             attrs['lgpnt'] = int(lgpnt.strip('\"()')) if lgpnt != '\"None\"' else 0
         #
 
@@ -769,20 +797,31 @@ def readDagDot(dot_file, save_dag=False):
 
                     # RealmFill nodes have no weight for now. So, I just pick one of them be used as weight
                     # of the new edge.
-                    if 'weight' not in iattrs or 'weight' not in oattrs:
-                        if 'weight' in iattrs:
-                            weight = int(iattrs['weight'])
-                        else:
-                            weight = int(oattrs['weight'])
-                        #
+                    if 'weight' in iattrs and 'weight' not in oattrs:
+                        weight = int(iattrs['weight'])
+
+                    elif 'weight' not in iattrs and 'weight' in oattrs:
+                        weight = int(oattrs['weight'])
+
                     elif 'weight' in iattrs and 'weight' in oattrs and \
                         iattrs['weight'] != oattrs['weight']:
-                        raise RuntimeError(f"Weights different when replaing edge. They should be equal!")
-                    else:
-                       weight = int(iattrs['weight'])
+                        if isrc == '_init_':
+                            weight = int(oattrs['weight'])
+                        else:
+                            raise RuntimeError(f"Weights different when replaing edge. They should be equal!")
+
+                    elif 'weight' in iattrs and 'weight' in oattrs:
+                        weight = int(iattrs['weight'])
                     #
 
-                    dag.add_edge(isrc, odst, weight=weight)
+                    lgrasrc, lgradst = '\"None\"', '\"None\"'
+                    if 'lgrasrc' in iattrs and iattrs['lgrasrc'] != '\"None\"':
+                        lgrasrc = int(iattrs['lgrasrc'])
+
+                    if 'lgradst' in oattrs and oattrs['lgradst'] != '\"None\"':
+                        lgradst = int(oattrs['lgradst'])
+
+                    dag.add_edge(isrc, odst, weight=weight, lgrasrc=lgrasrc, lgradst=lgradst)
         ##  ##  ##
 
         # By removing nodes, the edges will also be deleted.
@@ -846,46 +885,21 @@ def readDagDot(dot_file, save_dag=False):
         attrs['itltotal'] = itlowner[owner]
     #
 
-    # Add single initial and final node
-    init_nodes  = [n for n, deg in dag.in_degree() if deg == 0]
-    final_nodes = [n for n, deg in dag.out_degree() if deg == 0]
-
-    if len(init_nodes) > 1:
-        inode = "_init_"
-        if inode not in dag:
-            dag.add_node(inode, lgtaskname=inode)
-            for k in init_nodes:
-                dag.add_edge(inode, k)
-        else:
-            raise RuntimeError(f"{inode} node name collision. find a new one!")
-        #
-    #
-
-    if len(final_nodes) > 1:
-        fnode = "_final_"
-        if fnode not in dag:
-            dag.add_node(fnode, lgtaskname=fnode)
-            for k in final_nodes:
-                dag.add_edge(k, fnode)
-        else:
-            raise RuntimeError(f"{fnode} node name collision. find a new one!")
-        #
-    #
-
-    logger.info(f"{dag}")
-
     if save_dag:
         dag_filename = os.path.basename(dot_file).split('.')[0] # remove path and extension
         dag_dot = './'+dag_filename+'_parsed.dot'
         nx.drawing.nx_pydot.write_dot(dag, dag_dot)
         logger.info(f"*** Saved dag as {dag_dot} ***")
+    #
+
+    if False:
         #pos = nx.spring_layout(dag)
         pos = nx.nx_pydot.graphviz_layout(dag, prog='dot')
         nx.draw(dag, pos=pos, with_labels=False)
         dag_pdf = dag_filename+'.pdf'
         plt.savefig(dag_pdf)
         logger.info(f"*** Saved dag as {dag_pdf} ***")
-    #   #
+    #
 
     return dag
 ###
