@@ -195,11 +195,11 @@ def schedule_dag(dag, linmodel, time_offset=0, rank_metric=RankMetric.MEAN,
 
         finaltime = 0.0
         for proc, jobs in processor_schedules.items():
-            logger.debug(f"Processor {proc} has the following jobs:")
-            logger.debug(f"\t{jobs}")
-            lastjobendtime = jobs[-1].end
-            lastjobprockind = jobs[-1].proc.kind.value
+            lastjobendtime = jobs[-1].end if len(jobs) > 0 else 0
+            lastjobprockind = jobs[-1].proc.kind.value if len(jobs) > 0 else None
             if args.pproc:
+                logger.debug(f"Processor {proc} {machine.procs[proc].kind.value} has the following jobs:")
+                logger.debug(f"\t{jobs}")
                 logger.info(f"Mapping {m_file} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
             if lastjobendtime > finaltime:
                 finaltime = lastjobendtime
@@ -1094,11 +1094,12 @@ if __name__ == "__main__":
 
     totaltime = 0.0
     for proc, jobs in processor_schedules.items():
-        logger.debug(f"Processor {proc} has the following jobs:")
-        logger.debug(f"\t{jobs}")
-        lastjobendtime = jobs[-1].end
-        lastjobprockind = jobs[-1].proc.kind.value
-        logger.debug(f"Mapping {best_mfile} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
+        lastjobendtime = jobs[-1].end if len(jobs) > 0 else 0
+        lastjobprockind = jobs[-1].proc.kind.value if len(jobs) > 0 else None
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Processor {proc} {machine.procs[proc].kind.value} has the following jobs:")
+            logger.debug(f"\t{jobs}")
+            logger.debug(f"Mapping {best_mfile} processor {proc} {lastjobprockind} has {len(jobs)} jobs and finished at {lastjobendtime}.")
         if lastjobendtime > totaltime:
             totaltime = lastjobendtime
 
