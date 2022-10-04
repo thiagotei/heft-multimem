@@ -50,35 +50,6 @@ Proc = namedtuple('Proc', 'id kind node socket')
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
 Machine = namedtuple('Machine', 'procs nodes paths interconnect')
 
-"""
-Default computation matrix - taken from Topcuoglu 2002 HEFT paper
-computation matrix: v x q matrix with v tasks and q PEs
-"""
-W0 = np.array([
-    [14, 16, 9],
-    [13, 19, 18],
-    [11, 13, 19],
-    [13, 8, 17],
-    [12, 13, 10],
-    [13, 16, 9],
-    [7, 15, 11],
-    [5, 11, 14],
-    [18, 12, 20],
-    [21, 7, 16]
-])
-
-"""
-Default communication matrix - not listed in Topcuoglu 2002 HEFT paper
-communication matrix: q x q matrix with q PEs
-
-Note that a communication cost of 0 is used for a given processor to itself
-"""
-C0 = np.array([
-    [0, 1, 1],
-    [1, 0, 1],
-    [1, 1, 0]
-])
-
 class RankMetric(Enum):
     MEAN = "MEAN"
     WORST = "WORST"
