@@ -47,6 +47,7 @@ class ProcKind(Enum):
 #   #   #
 
 Proc = namedtuple('Proc', 'id kind node socket')
+Task = namedtuple('Task', 'id name')
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
 Machine = namedtuple('Machine', 'procs nodes paths interconnect')
 
@@ -205,7 +206,7 @@ def _schedule_dag_mapping(_self, dag, machine, sorted_nodes, mapping, op_mode, r
         logger.debug(f"[schedule_dag] checking node {node}")
         if _self.task_schedules[node] is not None:
             continue
-        minTaskSchedule = ScheduleEvent(node, inf, inf, Proc(-1, None, None, None))
+        minTaskSchedule = ScheduleEvent(Task(node, dag.nodes[node]['lgtaskname']), inf, inf, Proc(-1, None, None, None))
 
         # If index task launch a subset of procs will be selected
         selprocs = machine.procs
@@ -587,11 +588,11 @@ def _compute_eft(_self, dag, node, proc, mapping, machine, nodetaskname):
             if (prev_job.start - computation_time) - ready_time > 0:
                 logger.debug(f"Found an insertion slot before the first job {prev_job} on processor {proc}")
                 job_start = ready_time
-                min_schedule = ScheduleEvent(node, job_start, job_start+computation_time, proc)
+                min_schedule = ScheduleEvent(Task(node, dag.nodes[node]['lgtaskname']), job_start, job_start+computation_time, proc)
                 break
         if idx == len(job_list)-1:
             job_start = max(ready_time, prev_job.end)
-            min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
+            min_schedule = ScheduleEvent(Task(node, dag.nodes[node]['lgtaskname']), job_start, job_start + computation_time, proc)
             break
         next_job = job_list[idx+1]
         #Start of next job - computation time == latest we can start in this window
@@ -601,13 +602,13 @@ def _compute_eft(_self, dag, node, proc, mapping, machine, nodetaskname):
         if (next_job.start - computation_time) - max(ready_time, prev_job.end) >= 0:
             job_start = max(ready_time, prev_job.end)
             logger.debug(f"\tInsertion is feasible. Inserting job with start time {job_start} and end time {job_start + computation_time} into the time slot [{prev_job.end}, {next_job.start}]")
-            min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
+            min_schedule = ScheduleEvent(Task(node, dag.nodes[node]['lgtaskname']), job_start, job_start + computation_time, proc)
             break
     else:
         #For-else loop: the else executes if the for loop exits without break-ing, which in this case means the number of jobs on this processor are 0
-        min_schedule = ScheduleEvent(node, ready_time, ready_time + computation_time, proc)
+        min_schedule = ScheduleEvent(Task(node, dag.nodes[node]['lgtaskname']), ready_time, ready_time + computation_time, proc)
     logger.debug(f"\tFor node {node} on processor {proc}, the EFT is {min_schedule}")
-    return min_schedule    
+    return min_schedule
 
 def tasksTimeCalc(linmodel, mapping):
     """Calculate computation cost for all tasks in a given according to linear model.
